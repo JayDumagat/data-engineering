@@ -1,0 +1,44 @@
+{"timestamp":"2026-10-05T09:38:37.190041Z","level":"info","event":"::group::Pre Execute","logger":"task","filename":"task_runner.py","lineno":2412}
+{"timestamp":"2026-10-05T09:38:39.472577Z","level":"info","event":"DAG bundles loaded: dags-folder","run_id":"scheduled__2026-10-05T09:36:00+00:00","map_index":-1,"try_number":1,"ti_id":"01a10b6d-f08f-743a-9f31-c585ef5793c3","dag_id":"test_scraper","task_id":"scrape_website","logger":"airflow.dag_processing.bundles.manager.DagBundlesManager","filename":"manager.py","lineno":304}
+{"timestamp":"2026-10-05T09:38:39.474368Z","level":"info","event":"Filling up the DagBag from /opt/airflow/dags/test_scraper.py","run_id":"scheduled__2026-10-05T09:36:00+00:00","map_index":-1,"try_number":1,"ti_id":"01a10b6d-f08f-743a-9f31-c585ef5793c3","dag_id":"test_scraper","task_id":"scrape_website","logger":"airflow.dag_processing.dagbag.BundleDagBag","filename":"dagbag.py","lineno":460}
+{"timestamp":"2026-10-05T09:38:39.636977Z","level":"info","event":"Worker startup parse complete","bundle_name":"dags-folder","bundle_version":null,"dag_file":"test_scraper.py","dag_id":"test_scraper","bundle_prepare_ms":3,"dag_file_parse_ms":162,"run_id":"scheduled__2026-10-05T09:36:00+00:00","map_index":-1,"try_number":1,"ti_id":"01a10b6d-f08f-743a-9f31-c585ef5793c3","task_id":"scrape_website","logger":"task","filename":"task_runner.py","lineno":1073}
+{"timestamp":"2026-10-05T09:38:39.659293Z","level":"info","event":"::endgroup::","run_id":"scheduled__2026-10-05T09:36:00+00:00","map_index":-1,"try_number":1,"ti_id":"01a10b6d-f08f-743a-9f31-c585ef5793c3","dag_id":"test_scraper","task_id":"scrape_website","logger":"task","filename":"task_runner.py","lineno":2232}
+{"timestamp":"2026-10-05T09:38:39.941935Z","level":"error","event":"[2026-10-05 09:38:39] INFO: Fetched (200) <GET https://edge.pse.com.ph/announcements/form.do> (referer: https://www.google.com/)","logger":"task.stderr"}
+{"timestamp":"2026-10-05T09:38:39.941725Z","level":"info","event":"Fetched (200) <GET https://edge.pse.com.ph/announcements/form.do> (referer: https://www.google.com/)","logger":"scrapling","run_id":"scheduled__2026-10-05T09:36:00+00:00","map_index":-1,"try_number":1,"ti_id":"01a10b6d-f08f-743a-9f31-c585ef5793c3","dag_id":"test_scraper","task_id":"scrape_website","filename":"custom.py","lineno":74}
+{"timestamp":"2026-10-05T09:38:39.943789Z","level":"info","event":"Status: 200","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.944272Z","level":"info","event":"Title: Company Announcements","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.944743Z","level":"info","event":"Links: 34","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.945173Z","level":"info","event":"/","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.945752Z","level":"info","event":"/keyword/form.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.946405Z","level":"info","event":"/companyDirectory/form.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.946801Z","level":"info","event":"/disclosureData/listing_applicants_list.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.947126Z","level":"info","event":"/disclosureData/watchlist_view.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.947492Z","level":"info","event":"/psei/form.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.947846Z","level":"info","event":"/disclosureData/etf_form.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.948215Z","level":"info","event":"/page/aboutPseEdge.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.948576Z","level":"info","event":"#","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.948924Z","level":"info","event":"/announcements/form.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.949244Z","level":"info","event":"/financialReports/form.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.949590Z","level":"info","event":"/otherReports/form.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.949950Z","level":"info","event":"/index/form.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.950634Z","level":"info","event":"/disclosureData/dividends_and_rights_info_form.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.951229Z","level":"info","event":"/disclosureData/halts_and_suspensions_list.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.951679Z","level":"info","event":"#","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.952087Z","level":"info","event":"/disclosureNotices/form.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.952444Z","level":"info","event":"/listingNotices/form.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.952792Z","level":"info","event":"/companyPage/marketCalendar.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.953147Z","level":"info","event":"#findCompany","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.953470Z","level":"info","event":"#sort","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.953917Z","level":"info","event":"#sort","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.954234Z","level":"info","event":"/page/disclaimer.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.954553Z","level":"info","event":"/page/disclaimer.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.954882Z","level":"info","event":"/page/privacyPolicy.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.955227Z","level":"info","event":"/page/linkPolicy.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.955733Z","level":"info","event":"/page/siteMap.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.956089Z","level":"info","event":"/page/contactUs.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.956551Z","level":"info","event":"/page/faqs.do","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.956910Z","level":"info","event":"#rss","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.957232Z","level":"info","event":"None","logger":"task.stdout"}
+{"timestamp":"2026-10-05T09:38:39.943338Z","level":"info","event":"Done. Returned value was: None","run_id":"scheduled__2026-10-05T09:36:00+00:00","map_index":-1,"try_number":1,"ti_id":"01a10b6d-f08f-743a-9f31-c585ef5793c3","dag_id":"test_scraper","task_id":"scrape_website","logger":"airflow.task.operators.airflow.providers.standard.decorators.python._PythonDecoratedOperator","filename":"python.py","lineno":233}
+{"timestamp":"2026-10-05T09:38:39.943498Z","level":"info","event":"::group::Post Execute","run_id":"scheduled__2026-10-05T09:36:00+00:00","map_index":-1,"try_number":1,"ti_id":"01a10b6d-f08f-743a-9f31-c585ef5793c3","dag_id":"test_scraper","task_id":"scrape_website","logger":"task","filename":"task_runner.py","lineno":1580}
+{"timestamp":"2026-10-05T09:38:39.976194Z","level":"info","event":"::endgroup::","run_id":"scheduled__2026-10-05T09:36:00+00:00","map_index":-1,"try_number":1,"ti_id":"01a10b6d-f08f-743a-9f31-c585ef5793c3","dag_id":"test_scraper","task_id":"scrape_website","logger":"task","filename":"task_runner.py","lineno":2379}

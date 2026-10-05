@@ -1,0 +1,17 @@
+data-engineering\
+│
+├── docker-compose.yml
+│
+├── .env
+│
+├── airflow\
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── dags\
+│   ├── logs\
+│   ├── plugins\
+│   └── config\
+│
+├── pipeline\
+│
+└── dbt\
