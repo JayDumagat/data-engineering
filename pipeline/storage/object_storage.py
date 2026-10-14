@@ -1,21 +1,35 @@
 import os
+from functools import lru_cache
 
 import boto3
 from botocore.config import Config
 
 
-def get_s3_client():
+@lru_cache(maxsize=4)
+def _create_s3_client(endpoint_url: str, access_key: str, secret_key: str, region: str):
+    """Reuse a connection-pooled S3 client for repeated lake operations."""
     return boto3.client(
         "s3",
-        endpoint_url=os.environ["S3_ENDPOINT_URL"],
-        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-        region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+        endpoint_url=endpoint_url,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region,
         config=Config(
-            s3={
-                "addressing_style": "path",
-            }
+            connect_timeout=10,
+            read_timeout=60,
+            max_pool_connections=16,
+            retries={"mode": "standard", "max_attempts": 4},
+            s3={"addressing_style": "path"},
         ),
+    )
+
+
+def get_s3_client():
+    return _create_s3_client(
+        os.environ["S3_ENDPOINT_URL"],
+        os.environ["AWS_ACCESS_KEY_ID"],
+        os.environ["AWS_SECRET_ACCESS_KEY"],
+        os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
     )
 
 
@@ -53,4 +67,24 @@ def download_bytes(
         Key=key,
     )
 
-    return response["Body"].read()
+    body = response["Body"]
+    try:
+        return body.read()
+    finally:
+        body.close()
+
+
+class S3ObjectStore:
+    """S3-compatible raw object adapter implementing the shared storage contract."""
+
+    def read(self, bucket: str, key: str) -> bytes:
+        return download_bytes(bucket=bucket, key=key)
+
+    def write(
+        self,
+        bucket: str,
+        key: str,
+        body: bytes,
+        content_type: str = "application/octet-stream",
+    ) -> dict[str, str]:
+        return upload_bytes(bucket=bucket, key=key, data=body, content_type=content_type)

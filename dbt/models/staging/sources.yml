@@ -1,0 +1,13 @@
+version: 2
+
+sources:
+  - name: pse_edge
+    schema: pse_edge
+    tables:
+      - name: records
+      - name: ingestion_runs
+  - name: pse_website
+    schema: pse_website
+    tables:
+      - name: records
+      - name: ingestion_runs

@@ -6,7 +6,6 @@ apache-airflow-providers-fab==3.9.0
 scrapling[fetchers]==0.4.15
 
 psycopg2-binary
-sqlalchemy
 
 boto3
 
@@ -14,7 +13,6 @@ pandera
 pydantic
 
 polars
-pyarrow
 
 
 dbt-core

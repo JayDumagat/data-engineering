@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+airflow/logs/
+dbt/logs/
+dbt/target/
+dbt/dbt_packages/

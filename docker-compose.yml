@@ -1,4 +1,4 @@
-name: scraping-platform
+name: data-engineering
 
 # ==============================================================
 # SHARED AIRFLOW CONFIGURATION
@@ -29,6 +29,25 @@ x-airflow-common: &airflow-common
 
     AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
     AIRFLOW__CORE__HIDE_SENSITIVE_VAR_CONN_FIELDS: "true"
+
+    # Airflow task logs are written locally for live reads and uploaded to
+    # SeaweedFS S3 when each task closes so the UI can read logs after workers
+    # restart or move to another host.
+    AIRFLOW__LOGGING__BASE_LOG_FOLDER: /opt/airflow/logs
+    AIRFLOW__LOGGING__REMOTE_LOGGING: "true"
+    AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER: s3://${S3_BUCKET_LOGS:-airflow-logs}/airflow
+    AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID: aws_default
+    AIRFLOW__LOGGING__DELETE_LOCAL_LOGS: "false"
+
+    # The Amazon provider uses this connection for the S3 task log handler.
+    # Credentials come from the AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY above.
+    AIRFLOW_CONN_AWS_DEFAULT: >-
+      {"conn_type":"aws","extra":{"endpoint_url":"http://seaweedfs:8333","region_name":"${S3_REGION:-us-east-1}","config_kwargs":{"s3":{"addressing_style":"path"}}}}
+
+    # Warehouse loading resolves this environment-defined Airflow connection
+    # through the Postgres provider hook; credentials stay out of DAG code.
+    AIRFLOW_CONN_PSE_WAREHOUSE: >-
+      {"conn_type":"postgres","host":"warehouse-postgres","port":5432,"login":"${WAREHOUSE_USER:-warehouse}","password":"${WAREHOUSE_PASSWORD}","schema":"${WAREHOUSE_DB:-warehouse}","extra":{"sqlalchemy_scheme":"postgresql+psycopg2"}}
 
     # ==========================================================
     # AIRFLOW METADATA DATABASE
@@ -85,6 +104,7 @@ x-airflow-common: &airflow-common
     S3_BUCKET_STAGE: ${S3_BUCKET_STAGE:-stage}
     S3_BUCKET_CURATED: ${S3_BUCKET_CURATED:-curated}
     S3_BUCKET_QUARANTINE: ${S3_BUCKET_QUARANTINE:-quarantine}
+    S3_BUCKET_LOGS: ${S3_BUCKET_LOGS:-airflow-logs}
 
     # Prevent AWS SDKs from trying EC2 metadata.
     AWS_EC2_METADATA_DISABLED: "true"
@@ -95,6 +115,28 @@ x-airflow-common: &airflow-common
 
     APP_ENV: ${APP_ENV:-development}
     LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+    # PSE EDGE public-site ingestion. Set PSE_RSS_FEEDS to one or more
+    # comma-separated feed URLs if the Exchange changes its RSS endpoint.
+    PSE_EDGE_BASE_URL: "${PSE_EDGE_BASE_URL:-https://edge.pse.com.ph}"
+    PSE_RSS_FEEDS: "${PSE_RSS_FEEDS:-https://www.pse.com.ph/feed/}"
+    PSE_EDGE_USER_AGENT: "${PSE_EDGE_USER_AGENT:-Mozilla/5.0 (compatible; PSEEdgeResearch/1.0)}"
+    PSE_MAX_SEARCH_PAGES: "${PSE_MAX_SEARCH_PAGES:-100}"
+    PSE_MAX_COMPANY_PROFILES: "${PSE_MAX_COMPANY_PROFILES:-500}"
+    PSE_MAX_PRICE_HISTORIES_PER_RUN: "${PSE_MAX_PRICE_HISTORIES_PER_RUN:-500}"
+    PSE_PRICE_HISTORY_START_DATE: "${PSE_PRICE_HISTORY_START_DATE:-2000-01-01}"
+    PSE_MAX_DOCUMENTS_PER_RUN: "${PSE_MAX_DOCUMENTS_PER_RUN:-100}"
+    PSE_REQUEST_DELAY_SECONDS: "${PSE_REQUEST_DELAY_SECONDS:-0.5}"
+    PSE_EDGE_CONCURRENCY: "${PSE_EDGE_CONCURRENCY:-6}"
+    PSE_SOURCE_POOL_SLOTS: "${PSE_SOURCE_POOL_SLOTS:-6}"
+    PSE_WEBSITE_BASE_URL: "${PSE_WEBSITE_BASE_URL:-https://www.pse.com.ph}"
+    PSE_WEBSITE_USER_AGENT: "${PSE_WEBSITE_USER_AGENT:-Mozilla/5.0 (compatible; PSEPublicResearch/1.0)}"
+    PSE_WEBSITE_CONCURRENCY: "${PSE_WEBSITE_CONCURRENCY:-4}"
+    PSE_WEBSITE_REQUEST_DELAY_SECONDS: "${PSE_WEBSITE_REQUEST_DELAY_SECONDS:-0.75}"
+    PSE_WEBSITE_MAX_PAGES: "${PSE_WEBSITE_MAX_PAGES:-3000}"
+    PSE_WEBSITE_MAX_ASSETS: "${PSE_WEBSITE_MAX_ASSETS:-3000}"
+    PSE_WEBSITE_POOL_SLOTS: "${PSE_WEBSITE_POOL_SLOTS:-4}"
+    PSE_ETL_WORKERS: "${PSE_ETL_WORKERS:-4}"
 
     PYTHONPATH: /opt/airflow
 
@@ -306,7 +348,7 @@ services:
   # ============================================================
   # S3 BUCKET INITIALIZATION
   #
-  # Creates the data lake buckets after SeaweedFS starts.
+  # Creates the data lake and Airflow task log buckets after SeaweedFS starts.
   #
   # ============================================================
 
@@ -371,6 +413,12 @@ services:
           --bucket ${S3_BUCKET_QUARANTINE:-quarantine} \
           2>/dev/null || true
 
+        aws \
+          --endpoint-url http://seaweedfs:8333 \
+          s3api create-bucket \
+          --bucket ${S3_BUCKET_LOGS:-airflow-logs} \
+          2>/dev/null || true
+
         echo "S3 buckets:"
         aws \
           --endpoint-url http://seaweedfs:8333 \
@@ -404,6 +452,22 @@ services:
 
       echo "Running FAB database migrations..."
       airflow fab-db migrate
+
+      echo "Configuring the shared PSE EDGE source pool..."
+      source_pool_slots="${PSE_SOURCE_POOL_SLOTS:-6}"
+      if ! [[ "$$source_pool_slots" =~ ^[1-9][0-9]*$ ]]; then
+        echo "PSE_SOURCE_POOL_SLOTS must be a positive integer; using 6."
+        source_pool_slots=6
+      fi
+      airflow pools set pse_edge_source "$$source_pool_slots" "Shared PSE EDGE request capacity across capture DAGs"
+
+      echo "Configuring the PSE public website source pool..."
+      website_pool_slots="${PSE_WEBSITE_POOL_SLOTS:-4}"
+      if ! [[ "$$website_pool_slots" =~ ^[1-9][0-9]*$ ]]; then
+        echo "PSE_WEBSITE_POOL_SLOTS must be a positive integer; using 4."
+        website_pool_slots=4
+      fi
+      airflow pools set pse_website_source "$$website_pool_slots" "PSE public website request capacity"
 
       echo "Checking Airflow admin account..."
 
@@ -446,6 +510,9 @@ services:
       airflow-redis:
         condition: service_healthy
 
+      s3-init:
+        condition: service_completed_successfully
+
 
   # ============================================================
   # AIRFLOW API SERVER + UI
@@ -485,6 +552,9 @@ services:
       airflow-redis:
         condition: service_healthy
 
+      s3-init:
+        condition: service_completed_successfully
+
     healthcheck:
         test:
           [
@@ -519,6 +589,9 @@ services:
 
       airflow-postgres:
         condition: service_healthy
+
+      s3-init:
+        condition: service_completed_successfully
 
       airflow-redis:
         condition: service_healthy
@@ -687,13 +760,16 @@ services:
   #
   # Scale:
   #
-  # docker compose up -d \
+  # docker compose --profile browser-scraping up -d \
   #   --scale airflow-worker-scrape-browser=2
   #
   # ============================================================
 
   airflow-worker-scrape-browser:
     <<: *airflow-common
+
+    profiles:
+      - browser-scraping
 
     command:
       - celery
@@ -730,7 +806,6 @@ services:
   # Intended for:
   #
   # Polars
-  # PyArrow
   # Pydantic
   # Pandera
   # Parquet generation

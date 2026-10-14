@@ -1,17 +1,55 @@
-data-engineering\
-│
-├── docker-compose.yml
-│
-├── .env
-│
-├── airflow\
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   ├── dags\
-│   ├── logs\
-│   ├── plugins\
-│   └── config\
-│
-├── pipeline\
-│
-└── dbt\
+data-engineering/
+├── .env                              # local credentials and service settings (never commit)
+├── .gitignore                        # bytecode, local Airflow logs, and generated dbt files
+├── docker-compose.yml                # Airflow, Redis, Postgres, and SeaweedFS services
+├── folder-structure.txt
+├── airflow/
+│   ├── Dockerfile                    # Airflow image, providers, and pipeline libraries
+│   ├── requirements.txt              # Airflow providers and pipeline libraries
+│   ├── config/                       # Airflow configuration mount
+│   ├── dags/
+│   │   ├── pse_edge_assets.py        # shared warehouse asset identifier
+│   │   ├── pse_edge_scraper.py       # scheduled capture, mapped RSS, transform, and load DAGs
+│   │   ├── pse_website_scraper.py    # public site capture, transform, and load DAG
+│   │   └── pse_edge_analytics.py     # asset-triggered dbt analytics DAG
+│   ├── logs/                         # local task logs; S3 remote logging is enabled
+│   └── plugins/                      # optional project-specific Airflow extensions
+├── dbt/
+│   ├── dbt_project.yml               # dbt project configuration
+│   ├── profiles.yml                  # warehouse profile; credentials read from environment
+│   └── models/
+│       ├── staging/                  # source declarations and warehouse staging views
+│       └── marts/                    # analytical views
+├── pipeline/
+│   ├── core/
+│   │   ├── concurrency.py            # bounded ordered worker-pool helper
+│   │   ├── contracts.py              # source, manifest, transform, and sink interfaces
+│   │   └── schemas.py                # shared manifest envelope validation
+│   ├── sources/
+│   │   ├── pse_edge/
+│   │   │   ├── catalog.py             # public page, search, and document endpoints
+│   │   │   ├── client.py              # pooled sessions, pacing, retries, and concurrency
+│   │   │   ├── connector.py           # PSE EDGE source contract implementation
+│   │   │   ├── parser.py              # HTML tables, JSON responses, and RSS/Atom
+│   │   │   ├── scraper.py             # crawl coordination and immutable raw captures
+│   │   │   └── README.md              # coverage, storage, configuration, and extensions
+│   │   └── pse_website/
+│   │       ├── catalog.py             # PSE site seeds, host allowlist, and asset rules
+│   │       ├── connector.py           # shared source connector implementation
+│   │       ├── crawler.py             # robots-aware incremental public-site crawl
+│   │       └── README.md              # scope, storage, and configuration
+│   ├── etl/
+│   │   ├── extract.py                # manifest and raw-object reads
+│   │   ├── transform.py              # bounded transform workers
+│   │   ├── quality.py                # normalized Polars frame and Pandera validation
+│   │   ├── routing.py                # per-dataset and record-type sink routing
+│   │   ├── load.py                   # sink orchestration and structured logs
+│   │   ├── sinks/                    # Parquet, PostgreSQL, and quarantine adapters
+│   │   ├── pse_edge/                  # PSE EDGE-specific normalization
+│   │   └── pse_website/               # PSE public website normalization
+│   └── storage/
+│       ├── object_storage.py          # pooled S3-compatible client and byte I/O
+│       └── warehouse.py               # PostgreSQL schema, upserts, and run audit
+└── tools/
+    ├── pse_edge_fetch.py              # optional one-page raw-capture utility
+    └── pse_website_fetch.py           # optional bounded PSE website capture
