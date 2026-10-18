@@ -5,15 +5,15 @@ apache-airflow-providers-fab==3.9.0
 
 scrapling[fetchers]==0.4.15
 
-psycopg2-binary
+psycopg2-binary==2.9.13
 
-boto3
+boto3==1.43.75
 
-pandera
-pydantic
+pandera==0.34.1
+pydantic==2.13.5
 
-polars
+polars==2.0.0
 
 
-dbt-core
-dbt-postgres
+dbt-core==1.12.6
+dbt-postgres==1.11.0

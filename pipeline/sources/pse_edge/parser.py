@@ -27,6 +27,8 @@ class _TableParser(HTMLParser):
         self._skip_depth = 0
         self._in_title = False
         self.title_parts: list[str] = []
+        self.form_fields: list[dict[str, Any]] = []
+        self._select_name = ""
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = {key.lower(): value or "" for key, value in attrs}
@@ -35,6 +37,26 @@ class _TableParser(HTMLParser):
             return
         if self._skip_depth:
             return
+        if tag.lower() == "input" and attributes.get("name"):
+            self.form_fields.append(
+                {
+                    "name": attributes["name"],
+                    "value": attributes.get("value", ""),
+                    "type": attributes.get("type", "text"),
+                    "id": attributes.get("id", ""),
+                }
+            )
+        elif tag.lower() == "select":
+            self._select_name = attributes.get("name", "")
+        elif tag.lower() == "option" and self._select_name:
+            self.form_fields.append(
+                {
+                    "name": self._select_name,
+                    "value": attributes.get("value", ""),
+                    "type": "option",
+                    "selected": "selected" in attributes,
+                }
+            )
         if tag.lower() == "title":
             self._in_title = True
         if tag.lower() == "table":
@@ -44,13 +66,22 @@ class _TableParser(HTMLParser):
         elif self._table_depth == 1 and tag.lower() == "tr":
             self._row = {"cells": []}
         elif self._table_depth == 1 and tag.lower() in {"th", "td"} and self._row is not None:
-            self._cell = {"kind": tag.lower(), "parts": [], "links": []}
+            self._cell = {"kind": tag.lower(), "parts": [], "links": [], "assets": []}
         elif self._table_depth == 1 and tag.lower() == "a" and self._cell is not None:
             self._cell["links"].append(
                 {
                     "text": "",
                     "href": attributes.get("href", ""),
                     "onclick": attributes.get("onclick", ""),
+                    "company_id": attributes.get("data-cmpy-id", ""),
+                }
+            )
+        elif self._table_depth == 1 and tag.lower() == "img" and self._cell is not None:
+            self._cell["assets"].append(
+                {
+                    "src": attributes.get("src", ""),
+                    "alt": attributes.get("alt", ""),
+                    "title": attributes.get("title", ""),
                 }
             )
         if tag.lower() in {"a", "iframe", "embed", "object", "source", "img"}:
@@ -61,6 +92,7 @@ class _TableParser(HTMLParser):
                         "href": address,
                         "onclick": attributes.get("onclick", ""),
                         "text": "",
+                        "company_id": attributes.get("data-cmpy-id", ""),
                     }
                 )
 
@@ -71,6 +103,8 @@ class _TableParser(HTMLParser):
             return
         if self._skip_depth:
             return
+        if tag == "select":
+            self._select_name = ""
         if tag == "title":
             self._in_title = False
         if tag == "table" and self._table_depth:
@@ -114,7 +148,10 @@ def parse_html_records(html: str, dataset: str, source_url: str) -> tuple[list[d
         if candidate.startswith("javascript:") or candidate.startswith("#"):
             candidate = ""
         if not candidate and link.get("onclick"):
-            edge_no = re.search(r"(?:edge_no=|openPopup\(['\"]?)([A-Za-z0-9]+)", link["onclick"])
+            edge_no = re.search(
+                r"(?:edge_no=|openDiscViewer\(['\"]?)([A-Za-z0-9_-]+)",
+                link["onclick"],
+            )
             if edge_no:
                 candidate = f"/openDiscViewer.do?edge_no={edge_no.group(1)}"
         if candidate:
@@ -132,6 +169,7 @@ def parse_html_records(html: str, dataset: str, source_url: str) -> tuple[list[d
             "title": _clean(" ".join(parser.title_parts)),
             "page_text": _clean(" ".join(parser.text_parts))[:100_000],
             "table_count": len(parser.tables),
+            "form_fields": parser.form_fields,
         }
     ]
 
@@ -168,6 +206,7 @@ def parse_html_records(html: str, dataset: str, source_url: str) -> tuple[list[d
                     "columns": columns,
                     "cells": values,
                     "links": cell_links,
+                    "assets": [asset for cell in cells for asset in cell["assets"]],
                 }
             )
 

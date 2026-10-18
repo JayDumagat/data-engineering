@@ -16,6 +16,7 @@ import os
 import re
 import uuid
 
+from pipeline.core.contracts import ObjectStore
 from pipeline.sources.pse_edge.client import PSEHTTPClient, PSEHTTPError
 from pipeline.sources.pse_edge.parser import parse_html_records, parse_rss_records
 from pipeline.sources.pse_website.catalog import (
@@ -29,7 +30,7 @@ from pipeline.sources.pse_website.catalog import (
     host_allowed,
     is_asset_url,
 )
-from pipeline.storage.object_storage import S3ObjectStore
+from pipeline.storage.object_storage import get_object_store
 
 
 LOGGER = logging.getLogger(__name__)
@@ -146,7 +147,7 @@ class _LocParser(HTMLParser):
             self._entry = None
 
 
-def _read_state(store: S3ObjectStore, bucket: str) -> dict[str, Any]:
+def _read_state(store: ObjectStore, bucket: str) -> dict[str, Any]:
     try:
         return json.loads(store.read(bucket, STATE_KEY))
     except Exception:
@@ -204,8 +205,9 @@ def crawl_public_site(
     *,
     run_id: str,
     options: dict[str, Any] | None = None,
+    object_store: ObjectStore | None = None,
 ) -> dict[str, Any]:
-    """Capture public HTML, sitemaps, feeds and linked files to immutable S3 raw storage."""
+    """Capture public HTML, sitemaps, feeds and linked files to immutable raw storage."""
     options = options or {}
     started_at = datetime.now(timezone.utc)
     ingest_local = started_at.astimezone(MANILA)
@@ -215,11 +217,14 @@ def crawl_public_site(
     worker_limit = options.get("max_concurrency")
     worker_limit = _bounded_int(worker_limit, 4, 16) if worker_limit is not None else None
     bucket = os.getenv("S3_BUCKET_RAW", "raw")
-    store = S3ObjectStore()
+    store = object_store if object_store is not None else get_object_store()
     previous = _read_state(store, bucket)
     old_urls = previous.get("urls", {}) if isinstance(previous, dict) else {}
     if not isinstance(old_urls, dict):
         old_urls = {}
+    pending_urls = previous.get("frontier", []) if isinstance(previous, dict) else []
+    if not isinstance(pending_urls, list):
+        pending_urls = []
     objects: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     robots: dict[str, RobotFileParser] = {}
@@ -260,7 +265,7 @@ def crawl_public_site(
             "PSE website crawl pacing configured: request_delay_seconds=%.2f",
             client.delay,
         )
-        seed_urls = [f"{base_url}{path}" for path in SEED_PATHS]
+        seed_urls = [*pending_urls, *(f"{base_url}{path}" for path in SEED_PATHS)]
         seed_urls.extend(sitemap_urls)
         frontier = [url for raw_url in seed_urls if page_robots is not None and (url := normalize_url(raw_url)) and _likely_page(url)]
         # Add a sitemap URL even if robots.txt did not advertise one.
@@ -275,6 +280,7 @@ def crawl_public_site(
         page_count = 0
         asset_count = 0
         unchanged_count = 0
+        robots_disallowed_count = 0
         sequence = 0
 
         while frontier and (page_count < max_pages or asset_count < max_assets):
@@ -288,6 +294,7 @@ def crawl_public_site(
                 policy = robots.get(host)
                 if policy is None or not _allowed(policy, normalized, user_agent):
                     visited.add(normalized)
+                    robots_disallowed_count += 1
                     continue
                 if is_asset_url(normalized):
                     if asset_count >= max_assets:
@@ -406,6 +413,22 @@ def crawl_public_site(
             frontier = sorted((set(discovered) | deferred) - visited)
 
         truncated = bool(frontier)
+        if robots_disallowed_count and page_count == 0 and asset_count == 0:
+            coverage_status = "blocked_by_robots"
+            failures.append(
+                {
+                    "dataset": "crawl_controls",
+                    "url": f"https://{base_host}/robots.txt",
+                    "error": "Robots policy disallows every discovered URL for the configured crawler",
+                    "required": True,
+                }
+            )
+        elif robots_disallowed_count:
+            coverage_status = "robots_restricted"
+        elif truncated:
+            coverage_status = "incomplete_truncated"
+        else:
+            coverage_status = "discovered_urls_captured"
         # Robots directives and a crawl summary are always retained as structured controls.
         control_records = [
             {"record_type": "robots_policy", "host": host, "robots_url": f"https://{host}/robots.txt", "text": text[:100_000]}
@@ -419,6 +442,9 @@ def crawl_public_site(
                 "visited_assets": asset_count,
                 "unchanged_urls": unchanged_count,
                 "truncated": truncated,
+                "pending_urls": len(frontier),
+                "robots_disallowed_urls": robots_disallowed_count,
+                "coverage_status": coverage_status,
                 "sitemaps_seen": len(sitemap_seen),
             }
         )
@@ -452,6 +478,9 @@ def crawl_public_site(
         "unchanged_urls": unchanged_count,
         "sitemaps_seen": len(sitemap_seen),
         "truncated": truncated,
+        "pending_urls": len(frontier),
+        "robots_disallowed_urls": robots_disallowed_count,
+        "coverage_status": coverage_status,
         "limits": {"max_pages": max_pages, "max_assets": max_assets},
     }
     manifest_payload = json.dumps(manifest, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -461,10 +490,43 @@ def crawl_public_site(
     )
     store.write(bucket, manifest_key, manifest_payload, "application/json")
     # Persist validators and link graph only after the run manifest is durable.
-    state = {"schema_version": 1, "updated_at": completed_at.isoformat(), "urls": next_state, "robots": robots_text}
+    state = {
+        "schema_version": 1,
+        "updated_at": completed_at.isoformat(),
+        "urls": next_state,
+        "robots": robots_text,
+        "frontier": sorted(set(frontier)),
+    }
     store.write(bucket, STATE_KEY, json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), "application/json")
     LOGGER.info(
-        "PSE public website crawl complete: run_id=%s pages=%d assets=%d unchanged=%d failures=%d truncated=%s manifest=s3://%s/%s",
-        run_id, page_count, asset_count, unchanged_count, len(failures), truncated, bucket, manifest_key,
+        "PSE public website crawl complete: run_id=%s pages=%d assets=%d unchanged=%d failures=%d "
+        "pending=%d robots_disallowed=%d coverage=%s truncated=%s manifest=s3://%s/%s",
+        run_id,
+        page_count,
+        asset_count,
+        unchanged_count,
+        len(failures),
+        len(frontier),
+        robots_disallowed_count,
+        coverage_status,
+        truncated,
+        bucket,
+        manifest_key,
     )
-    return {"run_id": run_id, "bucket": bucket, "manifest_key": manifest_key, **{key: manifest[key] for key in ("visited_pages", "visited_assets", "unchanged_urls", "truncated")}}
+    return {
+        "run_id": run_id,
+        "bucket": bucket,
+        "manifest_key": manifest_key,
+        **{
+            key: manifest[key]
+            for key in (
+                "visited_pages",
+                "visited_assets",
+                "unchanged_urls",
+                "pending_urls",
+                "robots_disallowed_urls",
+                "coverage_status",
+                "truncated",
+            )
+        },
+    }

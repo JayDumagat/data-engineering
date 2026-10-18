@@ -37,7 +37,7 @@ def capture_pse_website() -> dict[str, str]:
     from pipeline.core.contracts import IngestionRequest
     from pipeline.etl.extract import read_manifest
     from pipeline.sources.pse_website.connector import PSEWebsiteConnector
-    from pipeline.storage.object_storage import S3ObjectStore
+    from pipeline.storage.object_storage import get_object_store
 
     ti = get_current_context()["ti"]
     run_id = f"{ti.dag_id}__{ti.run_id}"
@@ -46,7 +46,8 @@ def capture_pse_website() -> dict[str, str]:
         ti.dag_id, ti.task_id, ti.run_id, WEBSITE_POOL_SLOTS,
     )
     try:
-        reference = PSEWebsiteConnector().extract(
+        object_store = get_object_store()
+        reference = PSEWebsiteConnector(object_store=object_store).extract(
             IngestionRequest(
                 source="pse_website",
                 scope="public_site",
@@ -54,12 +55,15 @@ def capture_pse_website() -> dict[str, str]:
                 options={"max_concurrency": WEBSITE_POOL_SLOTS},
             )
         )
-        manifest = read_manifest(reference, S3ObjectStore())
+        manifest = read_manifest(reference, object_store)
         required = [failure for failure in manifest.get("failures", []) if failure.get("required")]
         LOGGER.info(
-            "Source capture summary: source=pse_website pages=%s assets=%s unchanged=%s failures=%d truncated=%s",
+            "Source capture summary: source=pse_website pages=%s assets=%s unchanged=%s failures=%d "
+            "pending=%s robots_disallowed=%s coverage=%s truncated=%s",
             manifest.get("visited_pages", 0), manifest.get("visited_assets", 0),
-            manifest.get("unchanged_urls", 0), len(manifest.get("failures", [])), manifest.get("truncated", False),
+            manifest.get("unchanged_urls", 0), len(manifest.get("failures", [])),
+            manifest.get("pending_urls", 0), manifest.get("robots_disallowed_urls", 0),
+            manifest.get("coverage_status", "unknown"), manifest.get("truncated", False),
         )
         if required:
             raise RuntimeError(
@@ -80,6 +84,7 @@ def capture_pse_website() -> dict[str, str]:
 @task(queue="transform", retries=2, retry_delay=timedelta(minutes=5))
 def transform_pse_website(manifest: dict[str, str]) -> dict[str, object]:
     from pipeline.etl.pipeline import transform_to_lake
+    from pipeline.storage.object_storage import get_object_store
 
     ti = get_current_context()["ti"]
     LOGGER.info(
@@ -87,7 +92,11 @@ def transform_pse_website(manifest: dict[str, str]) -> dict[str, object]:
         ti.dag_id, ti.task_id, ti.run_id, manifest["bucket"], manifest["key"],
     )
     try:
-        result = transform_to_lake(manifest["bucket"], manifest["key"])
+        result = transform_to_lake(
+            manifest["bucket"],
+            manifest["key"],
+            object_store=get_object_store(),
+        )
     except Exception:
         LOGGER.exception("PSE website transformation failed: dag_id=%s run_id=%s", ti.dag_id, ti.run_id)
         raise
@@ -104,6 +113,7 @@ def transform_pse_website(manifest: dict[str, str]) -> dict[str, object]:
 def load_pse_website(etl_manifest: dict[str, object]) -> dict[str, object]:
     from airflow.providers.postgres.hooks.postgres import PostgresHook
     from pipeline.etl.pipeline import load_curated
+    from pipeline.storage.object_storage import get_object_store
 
     ti = get_current_context()["ti"]
     LOGGER.info(
@@ -115,7 +125,10 @@ def load_pse_website(etl_manifest: dict[str, object]) -> dict[str, object]:
     )
     try:
         result = load_curated(
-            str(etl_manifest["bucket"]), str(etl_manifest["key"]), warehouse_engine=engine
+            str(etl_manifest["bucket"]),
+            str(etl_manifest["key"]),
+            warehouse_engine=engine,
+            object_store=get_object_store(),
         )
     except Exception:
         LOGGER.exception("PSE website sink load failed: dag_id=%s run_id=%s", ti.dag_id, ti.run_id)

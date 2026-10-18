@@ -9,7 +9,7 @@ import logging
 import os
 import re
 
-from pipeline.core.contracts import ManifestRef, RunContext
+from pipeline.core.contracts import ManifestRef, ObjectStore, RunContext
 from pipeline.etl.extract import read_manifest
 from pipeline.etl.load import load_to_sinks
 from pipeline.etl.pse_edge.transformer import PSEEdgeTransformer
@@ -20,7 +20,7 @@ from pipeline.etl.sinks.postgres import PostgresRecordSink
 from pipeline.etl.sinks.quarantine import QuarantineSink
 from pipeline.etl.sinks.registry import SinkRegistry
 from pipeline.etl.transform import iter_transformed_objects
-from pipeline.storage.object_storage import S3ObjectStore
+from pipeline.storage.object_storage import get_object_store
 from pipeline.storage.warehouse import (
     ensure_source_schema,
     get_warehouse_engine,
@@ -60,9 +60,14 @@ def _run_context(manifest: dict[str, Any], reference: ManifestRef) -> RunContext
     )
 
 
-def transform_to_lake(manifest_bucket: str, manifest_key: str) -> dict[str, Any]:
+def transform_to_lake(
+    manifest_bucket: str,
+    manifest_key: str,
+    *,
+    object_store: ObjectStore | None = None,
+) -> dict[str, Any]:
     """Read raw objects, normalize/validate them, and write stage/curated Parquet."""
-    object_store = S3ObjectStore()
+    object_store = object_store if object_store is not None else get_object_store()
     reference = ManifestRef("pse_edge", "all", "unknown", manifest_bucket, manifest_key)
     manifest = read_manifest(reference, object_store)
     reference = ManifestRef(
@@ -186,9 +191,10 @@ def load_curated(
     etl_manifest_key: str,
     *,
     warehouse_engine: Any | None = None,
+    object_store: ObjectStore | None = None,
 ) -> dict[str, Any]:
     """Load routed curated rows to SQL and persist the ingestion audit row."""
-    object_store = S3ObjectStore()
+    object_store = object_store if object_store is not None else get_object_store()
     reference = ManifestRef("pse_edge", "all", "unknown", etl_manifest_bucket, etl_manifest_key)
     manifest = read_manifest(reference, object_store)
     source_reference = ManifestRef(
@@ -269,8 +275,22 @@ def load_curated(
     return result
 
 
-def transform_and_load(manifest_bucket: str, manifest_key: str) -> dict[str, Any]:
+def transform_and_load(
+    manifest_bucket: str,
+    manifest_key: str,
+    *,
+    object_store: ObjectStore | None = None,
+) -> dict[str, Any]:
     """Backward-compatible synchronous entry point for non-Airflow callers."""
-    transformed = transform_to_lake(manifest_bucket, manifest_key)
-    loaded = load_curated(transformed["bucket"], transformed["key"])
+    lake_store = object_store if object_store is not None else get_object_store()
+    transformed = transform_to_lake(
+        manifest_bucket,
+        manifest_key,
+        object_store=lake_store,
+    )
+    loaded = load_curated(
+        transformed["bucket"],
+        transformed["key"],
+        object_store=lake_store,
+    )
     return {**transformed, **loaded}

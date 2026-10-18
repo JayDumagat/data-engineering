@@ -50,6 +50,12 @@ def stable_key(dataset: str, source_url: str, payload: dict[str, Any]) -> str:
         if match:
             return f"edge_no={match.group(1)}"
         onclick = link.get("onclick") or ""
+        match = re.search(r"openDiscViewer\(['\"]?([A-Za-z0-9_-]+)", onclick)
+        if match:
+            return f"edge_no={match.group(1)}"
+        match = re.search(r"openPopup\(['\"]([^'\"]+)", onclick)
+        if match:
+            return f"calendar_event={match.group(1)}"
         ids = re.findall(r"['\"]?(\d{1,12})['\"]?", onclick)
         if len(ids) >= 2:
             return ":".join(ids[:2])

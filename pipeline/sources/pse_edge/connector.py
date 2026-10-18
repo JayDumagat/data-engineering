@@ -7,25 +7,33 @@ import json
 import os
 import re
 
-from pipeline.core.contracts import IngestionRequest, ManifestRef
+from pipeline.core.contracts import IngestionRequest, ManifestRef, ObjectStore
 from pipeline.etl.extract import read_manifest
 from pipeline.sources.pse_edge.scraper import scrape
-from pipeline.storage.object_storage import S3ObjectStore, upload_bytes
+from pipeline.storage.object_storage import get_object_store
 
 
 class PSEEdgeConnector:
     name = "pse_edge"
 
+    def __init__(self, object_store: ObjectStore | None = None) -> None:
+        self.object_store = object_store if object_store is not None else get_object_store()
+
     def extract(self, request: IngestionRequest) -> ManifestRef:
+        if request.source != self.name:
+            raise ValueError(f"Expected source {self.name!r}; received {request.source!r}")
         result = scrape(
             scope=request.scope,
             run_id=request.run_id,
             feed_urls=request.options.get("feed_urls"),
             max_concurrency=request.options.get("max_concurrency"),
+            request_delay_seconds=request.options.get("request_delay_seconds"),
+            full_history=bool(request.options.get("full_history", False)),
+            object_store=self.object_store,
         )
         return ManifestRef(
             source=self.name,
-            scope=request.scope,
+            scope=result["scope"],
             run_id=result["run_id"],
             bucket=result["bucket"],
             key=result["manifest_key"],
@@ -36,14 +44,15 @@ def merge_rss_manifests(
     references: list[dict[str, str]],
     *,
     run_id: str,
+    object_store: ObjectStore | None = None,
 ) -> dict[str, str]:
     """Combine mapped per-feed captures into one ETL input manifest."""
     if not references:
         raise ValueError("RSS ingestion produced no feed manifests")
 
-    object_store = S3ObjectStore()
+    manifest_store = object_store if object_store is not None else get_object_store()
     manifests = [
-        read_manifest(ManifestRef.from_mapping(reference), object_store)
+        read_manifest(ManifestRef.from_mapping(reference), manifest_store)
         for reference in references
     ]
     started_at = min(datetime.fromisoformat(item["started_at"]) for item in manifests)
@@ -72,10 +81,10 @@ def merge_rss_manifests(
         f"pse_edge/manifests/ingest_date={started_at:%Y-%m-%d}/"
         f"run_id={run_segment or 'rss'}.json"
     )
-    upload_bytes(
-        bucket=raw_bucket,
-        key=manifest_key,
-        data=json.dumps(merged, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+    manifest_store.write(
+        raw_bucket,
+        manifest_key,
+        json.dumps(merged, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
         content_type="application/json",
     )
     return ManifestRef(

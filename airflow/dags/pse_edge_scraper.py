@@ -3,10 +3,11 @@
 from datetime import timedelta
 import hashlib
 import logging
+import math
 import os
 
 import pendulum
-from airflow.sdk import dag, get_current_context, task
+from airflow.sdk import dag, get_current_context, task, task_group
 
 from pse_edge_assets import PSE_EDGE_WAREHOUSE
 
@@ -29,6 +30,36 @@ def _source_pool_slots() -> int:
 SOURCE_POOL_SLOTS = _source_pool_slots()
 
 
+def _source_job_slots() -> int:
+    default_slots = min(2, SOURCE_POOL_SLOTS)
+    try:
+        slots = int(os.getenv("PSE_EDGE_JOB_SLOTS") or default_slots)
+        if slots < 1:
+            raise ValueError("slot count must be positive")
+        return min(slots, SOURCE_POOL_SLOTS)
+    except ValueError:
+        LOGGER.warning("Invalid PSE_EDGE_JOB_SLOTS; using %d slots", default_slots)
+        return default_slots
+
+
+SOURCE_JOB_SLOTS = _source_job_slots()
+
+
+def _source_job_request_delay() -> float:
+    try:
+        base_delay = float(os.getenv("PSE_REQUEST_DELAY_SECONDS", "0.5"))
+        if not math.isfinite(base_delay) or base_delay < 0:
+            raise ValueError("request delay must be finite and non-negative")
+    except ValueError:
+        LOGGER.warning("Invalid PSE_REQUEST_DELAY_SECONDS; using 0.5 seconds")
+        base_delay = 0.5
+    parallel_jobs = max(1, SOURCE_POOL_SLOTS // SOURCE_JOB_SLOTS)
+    return base_delay * parallel_jobs
+
+
+SOURCE_JOB_REQUEST_DELAY = _source_job_request_delay()
+
+
 def _capture(
     scope: str,
     *,
@@ -37,9 +68,10 @@ def _capture(
 ) -> dict[str, str]:
     from pipeline.core.contracts import IngestionRequest
     from pipeline.sources.pse_edge.connector import PSEEdgeConnector
+    from pipeline.storage.object_storage import get_object_store
 
     ti = get_current_context()["ti"]
-    pipeline_run_id = run_id or f"{ti.dag_id}__{ti.run_id}"
+    pipeline_run_id = run_id or f"{ti.dag_id}__{scope}__{ti.run_id}__try_{ti.try_number}"
     LOGGER.info(
         "Source extract started: dag_id=%s task_id=%s run_id=%s pipeline_run_id=%s "
         "try=%s source=pse_edge scope=%s",
@@ -51,7 +83,8 @@ def _capture(
         scope,
     )
     try:
-        reference = PSEEdgeConnector().extract(
+        object_store = get_object_store()
+        reference = PSEEdgeConnector(object_store=object_store).extract(
             IngestionRequest(
                 source="pse_edge",
                 scope=scope,
@@ -61,9 +94,8 @@ def _capture(
         )
         if (options or {}).get("fail_on_required_failures"):
             from pipeline.etl.extract import read_manifest
-            from pipeline.storage.object_storage import S3ObjectStore
 
-            source_manifest = read_manifest(reference, S3ObjectStore())
+            source_manifest = read_manifest(reference, object_store)
             required_failures = [
                 failure for failure in source_manifest.get("failures", [])
                 if failure.get("required")
@@ -99,6 +131,7 @@ def _capture(
 
 def _transform(manifest: dict[str, str]) -> dict[str, object]:
     from pipeline.etl.pse_edge import transform_to_lake
+    from pipeline.storage.object_storage import get_object_store
 
     ti = get_current_context()["ti"]
     LOGGER.info(
@@ -111,7 +144,11 @@ def _transform(manifest: dict[str, str]) -> dict[str, object]:
         manifest["key"],
     )
     try:
-        result = transform_to_lake(manifest["bucket"], manifest["key"])
+        result = transform_to_lake(
+            manifest["bucket"],
+            manifest["key"],
+            object_store=get_object_store(),
+        )
     except Exception:
         LOGGER.exception(
             "Transformation failed: dag_id=%s task_id=%s run_id=%s source=%s",
@@ -128,6 +165,7 @@ def _transform(manifest: dict[str, str]) -> dict[str, object]:
 def _load(etl_manifest: dict[str, object]) -> dict[str, object]:
     from airflow.providers.postgres.hooks.postgres import PostgresHook
     from pipeline.etl.pse_edge import load_curated
+    from pipeline.storage.object_storage import get_object_store
 
     ti = get_current_context()["ti"]
     LOGGER.info(
@@ -148,6 +186,7 @@ def _load(etl_manifest: dict[str, object]) -> dict[str, object]:
             str(etl_manifest["bucket"]),
             str(etl_manifest["key"]),
             warehouse_engine=engine,
+            object_store=get_object_store(),
         )
     except Exception:
         LOGGER.exception(
@@ -164,16 +203,73 @@ def _load(etl_manifest: dict[str, object]) -> dict[str, object]:
     return result
 
 
+@task(queue="default")
+def list_configured_pse_edge_jobs() -> list[str]:
+    from pipeline.sources.pse_edge.catalog import (
+        DEFAULT_PSE_EDGE_JOBS,
+        PSE_EDGE_FULL_BACKFILL_JOBS,
+        PSE_EDGE_JOBS,
+    )
+
+    run_config = get_current_context()["dag_run"].conf or {}
+    configured = (
+        run_config.get("jobs")
+        or os.getenv("PSE_EDGE_JOBS")
+        or ",".join(DEFAULT_PSE_EDGE_JOBS)
+    )
+    if isinstance(configured, str):
+        scopes = [item.strip() for item in configured.split(",") if item.strip()]
+    elif isinstance(configured, list) and all(isinstance(item, str) for item in configured):
+        scopes = [item.strip() for item in configured if item.strip()]
+    else:
+        raise ValueError("The jobs run configuration must be a comma-separated string or string list")
+    scopes = list(dict.fromkeys(scopes))
+    expanded_scopes = []
+    for scope in scopes:
+        if scope == "all":
+            expanded_scopes.extend(PSE_EDGE_FULL_BACKFILL_JOBS)
+        else:
+            expanded_scopes.append(scope)
+    scopes = list(dict.fromkeys(expanded_scopes))
+    if not scopes:
+        raise ValueError("PSE_EDGE_JOBS must contain at least one configured job")
+    valid_scopes = {"configured_sources", *PSE_EDGE_JOBS}
+    unknown = [scope for scope in scopes if scope not in valid_scopes]
+    if unknown:
+        raise ValueError(
+            f"Unknown PSE_EDGE_JOBS values: {', '.join(unknown)}; "
+            f"available jobs: configured_sources, {', '.join(PSE_EDGE_JOBS)}"
+        )
+    LOGGER.info("Configured PSE EDGE jobs: %s", scopes)
+    return scopes
+
+
 @task(
     queue="scrape-light",
     pool="pse_edge_source",
-    pool_slots=SOURCE_POOL_SLOTS,
+    pool_slots=SOURCE_JOB_SLOTS,
     retries=2,
     retry_delay=timedelta(minutes=5),
-    execution_timeout=timedelta(hours=3),
+    execution_timeout=timedelta(hours=24),
 )
-def capture_pse_edge():
-    return _capture(scope="all", options={"max_concurrency": SOURCE_POOL_SLOTS})
+def capture_pse_edge_job(scope: str) -> dict[str, str]:
+    run_config = get_current_context()["dag_run"].conf or {}
+    selected_jobs = run_config.get("jobs") or os.getenv("PSE_EDGE_JOBS", "")
+    if isinstance(selected_jobs, str):
+        selected_jobs = {item.strip() for item in selected_jobs.split(",") if item.strip()}
+    elif isinstance(selected_jobs, list):
+        selected_jobs = {item.strip() for item in selected_jobs if isinstance(item, str)}
+    else:
+        selected_jobs = set()
+    return _capture(
+        scope=scope,
+        options={
+            "max_concurrency": SOURCE_JOB_SLOTS,
+            "request_delay_seconds": SOURCE_JOB_REQUEST_DELAY,
+            "fail_on_required_failures": True,
+            "full_history": bool(run_config.get("full_history")) or "all" in selected_jobs,
+        },
+    )
 
 
 @task(queue="transform", retries=2, retry_delay=timedelta(minutes=5))
@@ -185,15 +281,29 @@ def transform_pse_edge(manifest: dict[str, str]):
     queue="transform",
     retries=2,
     retry_delay=timedelta(minutes=5),
-    outlets=[PSE_EDGE_WAREHOUSE],
 )
 def load_pse_edge(etl_manifest: dict[str, object]):
     return _load(etl_manifest)
 
 
+@task(queue="default", outlets=[PSE_EDGE_WAREHOUSE])
+def publish_pse_edge_warehouse(load_results: list[dict[str, object]]) -> dict[str, object]:
+    """Publish one asset event after every load in an ingestion batch succeeds."""
+    LOGGER.info("PSE EDGE warehouse batch published: job_results=%d", len(load_results))
+    return {"jobs_loaded": len(load_results)}
+
+
+@task_group(group_id="ingest_pse_edge_job")
+def ingest_pse_edge_job(scope: str):
+    """Run one independently retryable capture, transform, and load path."""
+    manifest = capture_pse_edge_job(scope)
+    transformed = transform_pse_edge(manifest)
+    return load_pse_edge(transformed)
+
+
 @dag(
     dag_id="pse_edge_full_ingestion",
-    description="Capture the PSE EDGE catalog, transform it to the lake, and load routed warehouse data.",
+    description="Run independently mapped PSE EDGE domain jobs and publish one warehouse update after the batch.",
     schedule="15 3 * * 1-5",
     start_date=MANILA_START,
     catchup=False,
@@ -202,9 +312,9 @@ def load_pse_edge(etl_manifest: dict[str, object]):
     tags=["pse", "edge", "etl"],
 )
 def pse_edge_full_ingestion():
-    manifest = capture_pse_edge()
-    transformed = transform_pse_edge(manifest)
-    load_pse_edge(transformed)
+    scopes = list_configured_pse_edge_jobs()
+    job_results = ingest_pse_edge_job.expand(scope=scopes)
+    publish_pse_edge_warehouse(job_results)
 
 
 @task(queue="default")
@@ -229,7 +339,7 @@ def list_configured_pse_rss_feeds() -> list[str]:
 def capture_pse_edge_rss_feed(feed_url: str) -> dict[str, str]:
     ti = get_current_context()["ti"]
     feed_key = hashlib.sha256(feed_url.encode("utf-8")).hexdigest()[:12]
-    feed_run_id = f"{ti.dag_id}__{ti.run_id}__rss_{feed_key}"
+    feed_run_id = f"{ti.dag_id}__{ti.run_id}__rss_{feed_key}__try_{ti.try_number}"
     LOGGER.info(
         "Mapped RSS feed capture started: dag_id=%s task_id=%s run_id=%s feed_key=%s",
         ti.dag_id,
@@ -251,10 +361,15 @@ def capture_pse_edge_rss_feed(feed_url: str) -> dict[str, str]:
 @task(queue="transform", retries=2, retry_delay=timedelta(minutes=5))
 def merge_pse_edge_rss_manifests(references: list[dict[str, str]]) -> dict[str, str]:
     from pipeline.sources.pse_edge.connector import merge_rss_manifests
+    from pipeline.storage.object_storage import get_object_store
 
     ti = get_current_context()["ti"]
     run_id = f"{ti.dag_id}__{ti.run_id}"
-    merged = merge_rss_manifests(references, run_id=run_id)
+    merged = merge_rss_manifests(
+        references,
+        run_id=run_id,
+        object_store=get_object_store(),
+    )
     LOGGER.info(
         "RSS manifest reduction complete: dag_id=%s task_id=%s run_id=%s feed_manifests=%d "
         "manifest=s3://%s/%s",
@@ -283,7 +398,8 @@ def pse_edge_rss_ingestion():
     feed_manifests = capture_pse_edge_rss_feed.expand(feed_url=feed_urls)
     merged_manifest = merge_pse_edge_rss_manifests(feed_manifests)
     transformed = transform_pse_edge(merged_manifest)
-    load_pse_edge(transformed)
+    loaded = load_pse_edge(transformed)
+    publish_pse_edge_warehouse([loaded])
 
 
 pse_edge_full_ingestion()

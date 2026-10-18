@@ -1,8 +1,12 @@
+"""S3-compatible object storage adapter and default store factory."""
+
 import os
 from functools import lru_cache
 
 import boto3
 from botocore.config import Config
+
+from pipeline.core.contracts import ObjectStore
 
 
 @lru_cache(maxsize=4)
@@ -88,3 +92,8 @@ class S3ObjectStore:
         content_type: str = "application/octet-stream",
     ) -> dict[str, str]:
         return upload_bytes(bucket=bucket, key=key, data=body, content_type=content_type)
+
+
+def get_object_store() -> ObjectStore:
+    """Create the default S3-compatible adapter for pipeline flows."""
+    return S3ObjectStore()

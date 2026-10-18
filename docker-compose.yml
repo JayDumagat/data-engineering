@@ -5,11 +5,8 @@ name: data-engineering
 # ==============================================================
 
 x-airflow-common: &airflow-common
-  build:
-    context: ./airflow
-    dockerfile: Dockerfile
-
   image: scraping-airflow:3.3.2
+  pull_policy: never
 
   restart: unless-stopped
 
@@ -121,14 +118,20 @@ x-airflow-common: &airflow-common
     PSE_EDGE_BASE_URL: "${PSE_EDGE_BASE_URL:-https://edge.pse.com.ph}"
     PSE_RSS_FEEDS: "${PSE_RSS_FEEDS:-https://www.pse.com.ph/feed/}"
     PSE_EDGE_USER_AGENT: "${PSE_EDGE_USER_AGENT:-Mozilla/5.0 (compatible; PSEEdgeResearch/1.0)}"
-    PSE_MAX_SEARCH_PAGES: "${PSE_MAX_SEARCH_PAGES:-100}"
-    PSE_MAX_COMPANY_PROFILES: "${PSE_MAX_COMPANY_PROFILES:-500}"
-    PSE_MAX_PRICE_HISTORIES_PER_RUN: "${PSE_MAX_PRICE_HISTORIES_PER_RUN:-500}"
+    # Zero means no application-level cap; set a positive value for an explicit bounded run.
+    PSE_MAX_SEARCH_PAGES: "${PSE_MAX_SEARCH_PAGES:-0}"
+    PSE_MAX_COMPANY_PROFILES: "${PSE_MAX_COMPANY_PROFILES:-0}"
+    PSE_MAX_PRICE_HISTORIES_PER_RUN: "${PSE_MAX_PRICE_HISTORIES_PER_RUN:-0}"
     PSE_PRICE_HISTORY_START_DATE: "${PSE_PRICE_HISTORY_START_DATE:-2000-01-01}"
-    PSE_MAX_DOCUMENTS_PER_RUN: "${PSE_MAX_DOCUMENTS_PER_RUN:-100}"
+    PSE_CALENDAR_START_YEAR: "${PSE_CALENDAR_START_YEAR:-2016}"
+    PSE_MAX_CALENDAR_MONTHS: "${PSE_MAX_CALENDAR_MONTHS:-0}"
+    PSE_MAX_DOCUMENTS_PER_RUN: "${PSE_MAX_DOCUMENTS_PER_RUN:-0}"
+    PSE_EDGE_SEARCH_WINDOW_DAYS: "${PSE_EDGE_SEARCH_WINDOW_DAYS:-}"
     PSE_REQUEST_DELAY_SECONDS: "${PSE_REQUEST_DELAY_SECONDS:-0.5}"
     PSE_EDGE_CONCURRENCY: "${PSE_EDGE_CONCURRENCY:-6}"
     PSE_SOURCE_POOL_SLOTS: "${PSE_SOURCE_POOL_SLOTS:-6}"
+    PSE_EDGE_JOB_SLOTS: "${PSE_EDGE_JOB_SLOTS:-}"
+    PSE_EDGE_JOBS: "${PSE_EDGE_JOBS:-}"
     PSE_WEBSITE_BASE_URL: "${PSE_WEBSITE_BASE_URL:-https://www.pse.com.ph}"
     PSE_WEBSITE_USER_AGENT: "${PSE_WEBSITE_USER_AGENT:-Mozilla/5.0 (compatible; PSEPublicResearch/1.0)}"
     PSE_WEBSITE_CONCURRENCY: "${PSE_WEBSITE_CONCURRENCY:-4}"
@@ -437,6 +440,12 @@ services:
   airflow-init:
     <<: *airflow-common
 
+    # This is the single build owner for the shared default Airflow image.
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+      target: airflow-base
+
     restart: "no"
 
     entrypoint:
@@ -453,43 +462,8 @@ services:
       echo "Running FAB database migrations..."
       airflow fab-db migrate
 
-      echo "Configuring the shared PSE EDGE source pool..."
-      source_pool_slots="${PSE_SOURCE_POOL_SLOTS:-6}"
-      if ! [[ "$$source_pool_slots" =~ ^[1-9][0-9]*$ ]]; then
-        echo "PSE_SOURCE_POOL_SLOTS must be a positive integer; using 6."
-        source_pool_slots=6
-      fi
-      airflow pools set pse_edge_source "$$source_pool_slots" "Shared PSE EDGE request capacity across capture DAGs"
-
-      echo "Configuring the PSE public website source pool..."
-      website_pool_slots="${PSE_WEBSITE_POOL_SLOTS:-4}"
-      if ! [[ "$$website_pool_slots" =~ ^[1-9][0-9]*$ ]]; then
-        echo "PSE_WEBSITE_POOL_SLOTS must be a positive integer; using 4."
-        website_pool_slots=4
-      fi
-      airflow pools set pse_website_source "$$website_pool_slots" "PSE public website request capacity"
-
-      echo "Checking Airflow admin account..."
-
-      if airflow users list --output plain | grep -q "${AIRFLOW_ADMIN_USERNAME:-admin}"; then
-        echo "Admin user already exists."
-      else
-        airflow users create \
-          --username "${AIRFLOW_ADMIN_USERNAME:-admin}" \
-          --password "${AIRFLOW_ADMIN_PASSWORD}" \
-          --firstname "${AIRFLOW_ADMIN_FIRSTNAME:-Data}" \
-          --lastname "${AIRFLOW_ADMIN_LASTNAME:-Admin}" \
-          --role Admin \
-          --email "${AIRFLOW_ADMIN_EMAIL:-admin@example.local}"
-      fi
-
-      echo
-      echo "Airflow version:"
-      airflow version
-
-      echo
-      echo "Active auth manager:"
-      airflow config get-value core auth_manager
+      echo "Reconciling project-owned Airflow pools and admin account..."
+      python /opt/airflow/bootstrap_runtime.py
 
       echo
       echo "Airflow initialization completed."
@@ -596,17 +570,19 @@ services:
       airflow-redis:
         condition: service_healthy
 
+    # This Airflow CLI probe can take longer during cold startup, so give it
+    # room to finish and check once per minute instead of thrashing.
     healthcheck:
       test:
         [
           "CMD-SHELL",
-          "curl --fail http://localhost:8974/health || exit 1"
+          "airflow jobs check --job-type SchedulerJob --hostname \"$$HOSTNAME\""
         ]
 
-      interval: 30s
-      timeout: 10s
+      interval: 60s
+      timeout: 30s
       retries: 5
-      start_period: 30s
+      start_period: 180s
 
 
   # ============================================================
@@ -767,6 +743,13 @@ services:
 
   airflow-worker-scrape-browser:
     <<: *airflow-common
+
+    # Browser binaries are built only for this opt-in worker profile.
+    image: scraping-airflow-browser:3.3.2
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+      target: airflow-browser
 
     profiles:
       - browser-scraping

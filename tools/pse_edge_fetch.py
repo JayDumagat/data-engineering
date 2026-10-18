@@ -1,35 +1,43 @@
-"""Fetch one PSE EDGE announcements page into the raw object-store bucket."""
+"""Capture one PSE EDGE data job into raw object storage."""
 
+from __future__ import annotations
+
+import argparse
 from datetime import datetime, timezone
 import json
-import os
-import uuid
 
-from pipeline.sources.pse_edge.client import PSEEdgeClient
-from pipeline.storage.object_storage import upload_bytes
+from pipeline.core.contracts import IngestionRequest
+from pipeline.sources.pse_edge.catalog import PSE_EDGE_JOBS
+from pipeline.sources.pse_edge.connector import PSEEdgeConnector
 
 
-def fetch_announcement_page() -> dict[str, object]:
-    base_url = os.getenv("PSE_EDGE_BASE_URL", "https://edge.pse.com.ph").rstrip("/")
-    url = f"{base_url}/announcements/form.do"
-    with PSEEdgeClient() as client:
-        response = client.get(url)
-
-    now = datetime.now(timezone.utc)
-    key = (
-        "pse_edge/announcements/"
-        f"year={now:%Y}/month={now:%m}/day={now:%d}/hour={now:%H}/"
-        f"{now:%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}.html"
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--scope",
+        choices=("configured_sources", "all", "rss", *PSE_EDGE_JOBS),
+        default="configured_sources",
+        help="Capture all catalog sources by default; 'all' is a legacy alias for configured_sources.",
     )
-    bucket = os.getenv("S3_BUCKET_RAW", "raw")
-    upload_bytes(
-        bucket=bucket,
-        key=key,
-        data=response.body,
-        content_type="text/html",
+    parser.add_argument("--workers", type=int, default=None, help="Optional request-worker override")
+    parser.add_argument(
+        "--full-history",
+        action="store_true",
+        help="Leave date filters open when running a named job",
     )
-    return {"bucket": bucket, "key": key, "url": url, "status": response.status}
+    args = parser.parse_args()
+
+    run_id = f"manual__{args.scope}__{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    reference = PSEEdgeConnector().extract(
+        IngestionRequest(
+            source="pse_edge",
+            scope=args.scope,
+            run_id=run_id,
+            options={"max_concurrency": args.workers, "full_history": args.full_history},
+        )
+    )
+    print(json.dumps(reference.to_dict(), indent=2))
 
 
 if __name__ == "__main__":
-    print(json.dumps(fetch_announcement_page(), indent=2))
+    main()

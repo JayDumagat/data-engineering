@@ -2,23 +2,46 @@
 
 from typing import Any
 
+from pipeline.core.contracts import ObjectStore
 
-def transform_and_load(manifest_bucket: str, manifest_key: str) -> dict[str, Any]:
+
+def transform_and_load(
+    manifest_bucket: str,
+    manifest_key: str,
+    *,
+    object_store: ObjectStore | None = None,
+) -> dict[str, Any]:
     """Load a source manifest through the PSE EDGE ETL pipeline."""
     from pipeline.etl.pipeline import transform_and_load as run_pipeline
 
-    return run_pipeline(manifest_bucket, manifest_key)
+    return run_pipeline(manifest_bucket, manifest_key, object_store=object_store)
 
 
-def transform_to_lake(manifest_bucket: str, manifest_key: str) -> dict[str, Any]:
+def transform_to_lake(
+    manifest_bucket: str,
+    manifest_key: str,
+    *,
+    object_store: ObjectStore | None = None,
+) -> dict[str, Any]:
     """Run extraction, transformation, validation, and lake writes."""
     from pipeline.etl.pipeline import transform_to_lake as run_transform
 
-    return run_transform(manifest_bucket, manifest_key)
+    return run_transform(manifest_bucket, manifest_key, object_store=object_store)
 
 
-def load_curated(manifest_bucket: str, manifest_key: str) -> dict[str, Any]:
+def load_curated(
+    manifest_bucket: str,
+    manifest_key: str,
+    *,
+    warehouse_engine: Any | None = None,
+    object_store: ObjectStore | None = None,
+) -> dict[str, Any]:
     """Load routed curated objects to configured relational sinks."""
     from pipeline.etl.pipeline import load_curated as run_load
 
-    return run_load(manifest_bucket, manifest_key)
+    return run_load(
+        manifest_bucket,
+        manifest_key,
+        warehouse_engine=warehouse_engine,
+        object_store=object_store,
+    )

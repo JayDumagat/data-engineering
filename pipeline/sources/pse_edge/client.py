@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import logging
+import math
 import os
 import threading
 import time
@@ -45,10 +46,17 @@ class PSEHTTPClient:
         user_agent: str = "Mozilla/5.0 (compatible; PSEPublicResearch/1.0)",
         concurrency_env: str = "PSE_EDGE_CONCURRENCY",
         delay_env: str = "PSE_REQUEST_DELAY_SECONDS",
+        request_delay_seconds: float | None = None,
     ) -> None:
         default_delay = "0.75" if delay_env == "PSE_WEBSITE_REQUEST_DELAY_SECONDS" else "0.5"
         try:
-            delay = float(os.getenv(delay_env, default_delay))
+            delay = float(
+                os.getenv(delay_env, default_delay)
+                if request_delay_seconds is None
+                else request_delay_seconds
+            )
+            if not math.isfinite(delay) or delay < 0:
+                raise ValueError("request delay must be a finite non-negative number")
         except ValueError:
             LOGGER.warning("Invalid %s; using %s seconds", delay_env, default_delay)
             delay = float(default_delay)
@@ -100,8 +108,23 @@ class PSEHTTPClient:
     def get(self, url: str, headers: dict[str, str] | None = None) -> Any:
         return self._request("GET", url, headers=headers)
 
-    def post(self, url: str, json_body: dict[str, Any] | None = None) -> Any:
-        return self._request("POST", url, json_body=json_body)
+    def post(
+        self,
+        url: str,
+        *,
+        form_body: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> Any:
+        if form_body is not None and json_body is not None:
+            raise ValueError("A request cannot send both form and JSON bodies")
+        return self._request(
+            "POST",
+            url,
+            form_body=form_body,
+            json_body=json_body,
+            headers=headers,
+        )
 
     def _pace(self) -> None:
         with self._pace_lock:
@@ -136,6 +159,7 @@ class PSEHTTPClient:
         self,
         method: str,
         url: str,
+        form_body: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
     ) -> Any:
@@ -149,6 +173,16 @@ class PSEHTTPClient:
             try:
                 if method == "GET":
                     response = session.get(url, headers=headers) if headers else session.get(url)
+                elif form_body is not None:
+                    response = session.post(
+                        url,
+                        data=form_body,
+                        headers={
+                            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                            "X-Requested-With": "XMLHttpRequest",
+                            **(headers or {}),
+                        },
+                    )
                 elif json_body is None:
                     response = session.post(url)
                 else:
@@ -189,7 +223,12 @@ class PSEHTTPClient:
 class PSEEdgeClient(PSEHTTPClient):
     """PSE EDGE transport using its own endpoint and configuration names."""
 
-    def __init__(self, worker_limit: int | None = None) -> None:
+    def __init__(
+        self,
+        worker_limit: int | None = None,
+        *,
+        request_delay_seconds: float | None = None,
+    ) -> None:
         super().__init__(
             worker_limit=worker_limit,
             base_url=os.getenv("PSE_EDGE_BASE_URL", "https://edge.pse.com.ph"),
@@ -197,6 +236,7 @@ class PSEEdgeClient(PSEHTTPClient):
                 "PSE_EDGE_USER_AGENT",
                 "Mozilla/5.0 (compatible; PSEEdgeResearch/1.0; +https://edge.pse.com.ph/)",
             ),
+            request_delay_seconds=request_delay_seconds,
         )
 
 

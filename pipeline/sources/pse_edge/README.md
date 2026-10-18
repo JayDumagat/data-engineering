@@ -1,74 +1,100 @@
 # PSE EDGE source
 
-This connector captures public PSE EDGE pages, search endpoints, linked disclosure files, and the configured RSS/Atom feeds. The full crawl covers the public portal catalog in `catalog.py`; it does not include licensed exchange feeds or endpoints requiring separate authorization.
+The source connector captures PSE EDGE's public site-map routes, form-backed search endpoints, issuer pages, historical market views, and PSE-hosted files. Each domain remains an independently runnable job; a separate full-catalog scope is available for the initial backfill. The live [PSE EDGE site map](https://edge.pse.com.ph/page/siteMap.do) and its linked public pages define the route inventory.
+
+## Coverage
+
+| Data area | Capture strategy |
+| --- | --- |
+| Portal pages and footer | Home, site map, About, FAQ, disclaimer, privacy, link policy, and contact pages |
+| Company directory | Form-encoded search across every available page; company and security IDs are extracted from directory rows |
+| Company pages | Stock data, company information, directors and management, financial reports, disclosures, and dividend/right result lists for every discovered issuer |
+| Exchange reports and notices | Company announcements, financial and other reports, disclosure notices, listing notices, and company disclosures, all paginated |
+| Advanced and special searches | Advanced Search with `*` and unbounded date range, PSEi disclosures, ETF disclosures, dividends, and stock rights |
+| Market data | Index summary snapshot, halts and suspensions, listing applicants, watch list, and ETF/PSEi search pages |
+| Market history | Stock history for each discovered company/security pair from `PSE_PRICE_HISTORY_START_DATE`; monthly calendar pages from 2016 through the current Manila month |
+| Files | PSE-hosted documents and attachments discovered in captured pages and search results, followed recursively |
+| New site-map pages | Any additional query-free `.do` routes found on the site map are captured as `sitemap_discovered_pages` |
+
+The full-catalog scope is exhaustive over the configured public catalog and the routes discovered from the public site map. It does not claim that PSE EDGE exposes every historical record through those routes. Some public pages currently return no rows or say they are being improved; those responses are retained as raw captures. A source error, repeated page, or configured positive limit is recorded in the run manifest so a partial run cannot look complete.
+
+PSE EDGE's footer states that its materials may be accessed and downloaded only for personal, non-commercial use unless otherwise stated. See the current [PSE disclaimer and access restrictions](https://edge.pse.com.ph/page/disclaimer.do) before using captured material outside that scope.
 
 ## Run lanes
 
-- `pse_edge_full_ingestion` runs weekdays at 03:15 Asia/Manila. It captures catalog pages, paginated searches, company profiles, price history, and discovered documents.
-- `pse_edge_rss_ingestion` polls the URLs in `PSE_RSS_FEEDS` every 15 minutes. Airflow reads the list at task runtime and dynamically maps one independently retryable capture task per distinct URL. A feed with a required fetch failure retries on its own and keeps its diagnostic manifest in raw storage; the ETL reducer waits for all mapped feeds to succeed. It combines the small manifest references into one ETL input, so payloads stay in object storage and do not travel through XCom. The variable accepts a comma-separated list; the default is `https://www.pse.com.ph/feed/`.
-- `pse_edge_analytics` runs dbt when either source's successful warehouse load emits its warehouse asset, including the `pse_website` source.
+- `pse_edge_full_ingestion` runs the named current-state jobs on weekdays at 03:15 Asia/Manila. Airflow maps one capture-transform-load group per domain, with independent retries, run IDs, manifests, storage objects, and warehouse audits. The default scheduled set excludes issuer profiles, historical stock/calendar views, and the unfiltered company-disclosure archive.
+- Trigger `pse_edge_full_ingestion` with `{"jobs": ["all"]}` to map the full backfill into independent domain capture-transform-load paths, with date filters open. The set avoids duplicate directory/profile pulls by sourcing those records through `company_market_history`. `{"jobs": ["configured_sources"]}` remains available as a single-scope full capture. For focused backfills, run a named job with `{"jobs": ["financial_reports"], "full_history": true}` or run `company_disclosures`, `company_profiles`, `company_market_history`, or `market_calendar_archive`.
+- `pse_edge_rss_ingestion` is a separate 15-minute lane for configured PSE website RSS/Atom feeds. It is outside the PSE EDGE catalog.
+- `pse_edge_analytics` runs dbt after successful PSE EDGE, RSS, or PSE website warehouse loads.
 
-Search, profile, price-history, and document limits are configurable. Search history is bounded by `PSE_MAX_SEARCH_PAGES`; increase it for deeper backfills. The `pse_edge_source` Airflow pool is shared across both ingestion DAGs and defaults to six slots. A full crawl occupies the pool capacity and caps its internal request workers to that capacity; each mapped RSS task uses one slot and one HTTP worker, so multiple feeds can run concurrently while the full crawl and RSS lane remain mutually coordinated. Set `PSE_SOURCE_POOL_SLOTS` to change the shared capacity. Within each task, the HTTP client uses persistent sessions, retries for transient errors, and a shared request-start delay.
+The capture client uses pooled Scrapling sessions, form-encoded POSTs for PSE EDGE's AJAX searches, bounded concurrent batches, and one shared request pace across workers. Scheduled search jobs use a 14-day overlap where the source supports date filters; the full-catalog scope leaves dates blank to backfill all available history. It does not work around anti-bot challenges. A challenge or access-denied response is recorded as a failed source request.
 
 ## Source and ETL boundaries
 
-`PSEEdgeConnector` implements the shared `SourceConnector` contract. It returns a `ManifestRef` that identifies an immutable source manifest. Source connectors can be added for databases, APIs, or other systems by implementing that contract and writing their raw inputs through `ObjectStore`.
+`PSEEdgeConnector` implements the shared `SourceConnector` contract and writes immutable raw responses through `ObjectStore`. The page and search catalog lives in `catalog.py`; request transport, pagination, extraction, and storage live in `client.py`, `parser.py`, and `scraper.py`.
 
-The ETL runner reads the common manifest envelope and hands each raw object to a source-specific `Transformer`. Transformation and validation are separated from loading. The normalized record frame is checked with Pandera and represented in Polars. `DatasetRouter` chooses destinations by dataset and record type; `DataSink` adapters implement those destinations independently. The included sinks write Parquet to S3-compatible object storage, load selected records into PostgreSQL, and write transformation diagnostics to quarantine storage. A future document store, NoSQL database, or image store can be added as a sink without changing the PSE scraper.
+The ETL runner reads each source manifest and sends raw objects to a source-specific `Transformer`. Transformation and validation are separated from loading. Normalized records use Polars and Pandera; `DatasetRouter` selects destinations, and `DataSink` adapters implement them independently. S3-compatible raw/lake storage, PostgreSQL, and quarantine sinks can be replaced without changing PSE request logic.
 
-## Data destinations
+### Add a source
+
+Add the public route or `SearchSource` request shape to `catalog.py`, then assign it to a `PSEEdgeJob`. The mapped Airflow capture-transform-load group will schedule the named job. Add a source-specific parser or transformation only when its record shape requires one, and update `DatasetRouter` only when its destination differs.
+
+## Storage
 
 | Data | Destination | Notes |
 | --- | --- | --- |
-| Original HTML, JSON, RSS/XML, PDFs, images, videos, and other attachments | `raw` object-store bucket | Immutable capture; binary assets remain object bytes rather than SQL blobs |
-| Normalized records | `stage` object-store bucket | Zstandard Parquet, partitioned by source, dataset, and run |
-| Deduplicated records | `curated` object-store bucket | Parquet with one latest row per `(dataset, record_key)` in that run |
-| Searchable business records and ingestion audit | PostgreSQL `pse_edge` schema | JSONB payload plus stable record key, source object reference, and first/last-seen timestamps |
-| Transform errors | `quarantine` object-store bucket | JSON diagnostics retained for repair or replay |
-| Airflow task logs | `airflow-logs` object-store bucket | Airflow's Amazon provider S3 task handler; local task log copies are retained |
-| Analytics models | PostgreSQL `analytics` schema | dbt views over the warehouse tables |
+| Original HTML, JSON, RSS/XML, PDFs, images, videos, and other attachments | `raw` object-store bucket | Immutable source response bytes |
+| Normalized records | `stage` object-store bucket | Zstandard Parquet partitioned by source, dataset, and run |
+| Deduplicated records | `curated` object-store bucket | Latest row per `(dataset, record_key)` in the run |
+| Searchable records and ingestion audit | PostgreSQL `pse_edge` schema | JSONB payload, stable key, object reference, first/last-seen times |
+| Transform errors | `quarantine` object-store bucket | JSON diagnostics retained for replay |
+| Airflow task logs | `airflow-logs` object-store bucket | Remote S3 logs plus local task copies |
+| Analytics models | PostgreSQL `analytics` schema | dbt views over warehouse tables |
 
-`DatasetRouter` currently sends disclosure-asset metadata and binary-asset metadata to object storage only. The connector follows PSE-hosted document, image, and video links; their original bytes remain in the raw bucket. Other normalized datasets go to Parquet and PostgreSQL. Dataset and record-type restrictions are combined, so a broad record-type route cannot override a narrower dataset rule.
-
-## Libraries and Airflow providers
-
-- Scrapling provides the HTTP sessions used by the connector.
-- Polars builds and writes Parquet record frames; Pandera validates the normalized frame contract.
-- Pydantic validates the source-manifest envelope.
-- boto3 provides pooled S3-compatible object-store I/O; SQLAlchemy provides bounded PostgreSQL upserts.
-- dbt Core and the Postgres adapter build analytics models from warehouse tables.
-- Airflow's Celery, Postgres, Amazon, and FAB providers support distributed task execution, warehouse connections through `PostgresHook`, remote S3 task logs, and the configured auth manager. Airflow dynamic task mapping provides per-feed retries and logs; asset-aware scheduling starts dbt only after a warehouse load succeeds. Source and transformation work use separate Celery queues, and Airflow pools coordinate source pressure across DAGs.
-
-Airflow task functions use the task logger and include run IDs, manifest locations, row counts, sink outcomes, and exception traces. dbt output is forwarded line by line while the command runs, so it appears in the Airflow task log instead of being buffered until the subprocess exits.
-
-The current PSE connector uses static pages and public HTTP endpoints, so it runs on the `scrape-light` queue. The browser worker is disabled by default and can be started with the `browser-scraping` Compose profile when a future source needs JavaScript rendering.
+`DatasetRouter` sends attachment metadata and binary-asset metadata to object storage only. Original bytes stay in the raw bucket; other normalized records go to Parquet and PostgreSQL.
 
 ## Configuration
 
+All `PSE_MAX_*` variables default to `0`, which means no application-level cap. A positive value is an explicit cap; reaching it creates a required `truncated` failure in the manifest. Leave them at zero for the full public-catalog run.
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `PSE_EDGE_BASE_URL` | `https://edge.pse.com.ph` | Public portal base URL |
-| `PSE_RSS_FEEDS` | `https://www.pse.com.ph/feed/` | Comma-separated RSS or Atom feed URLs |
-| `PSE_MAX_SEARCH_PAGES` | `100` | Page cap per search endpoint |
-| `PSE_MAX_COMPANY_PROFILES` | `500` | Company-profile cap per full crawl |
-| `PSE_MAX_PRICE_HISTORIES_PER_RUN` | `500` | Security history cap per full crawl |
-| `PSE_PRICE_HISTORY_START_DATE` | `2000-01-01` | Start date for historical price requests |
-| `PSE_MAX_DOCUMENTS_PER_RUN` | `100` | Disclosure viewer or attachment cap per full crawl |
-| `PSE_EDGE_CONCURRENCY` | `6` | Maximum concurrent HTTP request workers inside one capture, bounded to 1–16 and the source-pool size |
-| `PSE_SOURCE_POOL_SLOTS` | `6` | Shared Airflow source capacity across full and RSS capture tasks |
-| `PSE_REQUEST_DELAY_SECONDS` | `0.5` | Minimum delay between request starts inside each crawl |
-| `PSE_ETL_WORKERS` | `4` | Concurrent raw-object reads and transforms, bounded to 1–16 |
-| `S3_BUCKET_RAW` | `raw` | Immutable source objects and source manifests |
+| `PSE_EDGE_BASE_URL` | `https://edge.pse.com.ph` | Public PSE EDGE base URL |
+| `PSE_MAX_SEARCH_PAGES` | `0` | Page cap per search endpoint |
+| `PSE_MAX_COMPANY_PROFILES` | `0` | Issuer profile cap per run |
+| `PSE_MAX_PRICE_HISTORIES_PER_RUN` | `0` | Company/security history cap per run |
+| `PSE_PRICE_HISTORY_START_DATE` | `2000-01-01` | First date requested for stock histories |
+| `PSE_CALENDAR_START_YEAR` | `2016` | First year in the public calendar selector |
+| `PSE_MAX_CALENDAR_MONTHS` | `0` | Calendar-month cap per run |
+| `PSE_MAX_DOCUMENTS_PER_RUN` | `0` | Discovered document cap per run |
+| `PSE_EDGE_CONCURRENCY` | `6` | HTTP workers, bounded to 1–16 and Airflow pool capacity |
+| `PSE_REQUEST_DELAY_SECONDS` | `0.5` | Shared request interval; Airflow scales by active jobs |
+| `PSE_SOURCE_POOL_SLOTS` | `6` | Shared Airflow source capacity |
+| `PSE_EDGE_JOB_SLOTS` | `2` | Source-pool slots and workers reserved by each mapped job |
+| `PSE_EDGE_JOBS` | Default current-state jobs | Optional comma-separated set of scheduled domain jobs |
+| `PSE_EDGE_SEARCH_WINDOW_DAYS` | Job default; `0` means unbounded | Override the rolling date window for jobs with date filters |
+| `PSE_RSS_FEEDS` | `https://www.pse.com.ph/feed/` | Separate comma-separated RSS/Atom feed list |
+| `PSE_ETL_WORKERS` | `4` | Concurrent raw-object reads and transforms |
+| `S3_BUCKET_RAW` | `raw` | Immutable responses and source manifests |
 | `S3_BUCKET_STAGE` | `stage` | Normalized Parquet objects and ETL manifests |
 | `S3_BUCKET_CURATED` | `curated` | Deduplicated Parquet objects |
-| `S3_BUCKET_QUARANTINE` | `quarantine` | Transformation error diagnostics |
+| `S3_BUCKET_QUARANTINE` | `quarantine` | Transformation diagnostics |
 | `S3_BUCKET_LOGS` | `airflow-logs` | Airflow remote task logs |
-| `WAREHOUSE_DATABASE_URL` | Compose warehouse URL | PostgreSQL connection for non-Airflow pipeline callers |
-| `AIRFLOW_CONN_PSE_WAREHOUSE` | Compose warehouse connection | Airflow PostgresHook connection used by the warehouse load task |
+| `WAREHOUSE_DATABASE_URL` | Compose warehouse URL | PostgreSQL for non-Airflow callers |
+| `AIRFLOW_CONN_PSE_WAREHOUSE` | Compose warehouse connection | PostgresHook connection for warehouse loads |
 
-For a single raw capture, run `python -m tools.pse_edge_fetch` from the repository root with the object-store environment configured.
+To run a full local backfill, use `python -m tools.pse_edge_fetch --scope configured_sources` with object-store configuration. The CLI also accepts `all` (the same full scope), any named job, and `rss`; add `--full-history` when backfilling a named date-filtered job. Through Airflow, use `{"jobs": ["all"]}` for separate domain pipelines or `{"jobs": ["configured_sources"]}` for a single full-catalog scope. A successful manifest records captured routes, source counts, failures, truncation, and coverage notes.
 
-## Warehouse queries
+## Libraries and orchestration
+
+- Scrapling provides pooled HTTP sessions; Polars and Pandera handle normalized frames and contracts.
+- Pydantic validates the source manifest; boto3 provides object storage; SQLAlchemy and Airflow's PostgresHook handle warehouse writes.
+- Airflow dynamic task mapping provides independent job retries and logs. Pools coordinate aggregate source pressure; capture and transform tasks use separate Celery queues.
+- dbt Core and the Postgres adapter build analytics models. The asset-aware DAG starts dbt after warehouse loads succeed.
+
+Airflow logs include run IDs, manifest locations, row counts, sink outcomes, and exception traces. dbt output is forwarded to the task log while the subprocess runs.
+
+## Example queries
 
 ```sql
 SELECT dataset, count(*)
