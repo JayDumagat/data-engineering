@@ -113,10 +113,10 @@ x-airflow-common: &airflow-common
     APP_ENV: ${APP_ENV:-development}
     LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
-    # PSE EDGE public-site ingestion. Set PSE_RSS_FEEDS to one or more
-    # comma-separated feed URLs if the Exchange changes its RSS endpoint.
+    # PSE EDGE portal capture and PSE website RSS ingestion use separate sources.
     PSE_EDGE_BASE_URL: "${PSE_EDGE_BASE_URL:-https://edge.pse.com.ph}"
-    PSE_RSS_FEEDS: "${PSE_RSS_FEEDS:-https://www.pse.com.ph/feed/}"
+    PSE_EDGE_RSS_FEEDS: "${PSE_EDGE_RSS_FEEDS:-}"
+    PSE_WEBSITE_RSS_FEEDS: "${PSE_WEBSITE_RSS_FEEDS:-https://www.pse.com.ph/feed/}"
     PSE_EDGE_USER_AGENT: "${PSE_EDGE_USER_AGENT:-Mozilla/5.0 (compatible; PSEEdgeResearch/1.0)}"
     # Zero means no application-level cap; set a positive value for an explicit bounded run.
     PSE_MAX_SEARCH_PAGES: "${PSE_MAX_SEARCH_PAGES:-0}"
@@ -136,9 +136,8 @@ x-airflow-common: &airflow-common
     PSE_WEBSITE_USER_AGENT: "${PSE_WEBSITE_USER_AGENT:-Mozilla/5.0 (compatible; PSEPublicResearch/1.0)}"
     PSE_WEBSITE_CONCURRENCY: "${PSE_WEBSITE_CONCURRENCY:-4}"
     PSE_WEBSITE_REQUEST_DELAY_SECONDS: "${PSE_WEBSITE_REQUEST_DELAY_SECONDS:-0.75}"
-    PSE_WEBSITE_MAX_PAGES: "${PSE_WEBSITE_MAX_PAGES:-3000}"
-    PSE_WEBSITE_MAX_ASSETS: "${PSE_WEBSITE_MAX_ASSETS:-3000}"
-    PSE_WEBSITE_POOL_SLOTS: "${PSE_WEBSITE_POOL_SLOTS:-4}"
+    PSE_WEBSITE_MAX_PAGES: "${PSE_WEBSITE_MAX_PAGES:-10}"
+    PSE_WEBSITE_POOL_SLOTS: "${PSE_WEBSITE_POOL_SLOTS:-2}"
     PSE_ETL_WORKERS: "${PSE_ETL_WORKERS:-4}"
 
     PYTHONPATH: /opt/airflow
@@ -296,6 +295,40 @@ services:
       timeout: 5s
       retries: 20
       start_period: 10s
+
+    networks:
+      - data-network
+
+
+  # ============================================================
+  # PSE DATA OBSERVATORY
+  #
+  # Next.js interface for browsing warehouse records and ingestion runs.
+  # ============================================================
+
+  data-viewer:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+
+    container_name: pse-data-viewer
+
+    restart: unless-stopped
+
+    environment:
+      PGHOST: warehouse-postgres
+      PGPORT: "5432"
+      PGDATABASE: ${WAREHOUSE_DB:-warehouse}
+      PGUSER: ${WAREHOUSE_USER:-warehouse}
+      PGPASSWORD: ${WAREHOUSE_PASSWORD}
+      NODE_ENV: production
+
+    ports:
+      - "127.0.0.1:${DATA_VIEWER_PORT:-3000}:3000"
+
+    depends_on:
+      warehouse-postgres:
+        condition: service_healthy
 
     networks:
       - data-network
@@ -736,23 +769,19 @@ services:
   #
   # Scale:
   #
-  # docker compose --profile browser-scraping up -d \
-  #   --scale airflow-worker-scrape-browser=2
+  # docker compose up -d --scale airflow-worker-scrape-browser=2
   #
   # ============================================================
 
   airflow-worker-scrape-browser:
     <<: *airflow-common
 
-    # Browser binaries are built only for this opt-in worker profile.
+    # Required by the JavaScript-rendered PSE Market Reports capture.
     image: scraping-airflow-browser:3.3.2
     build:
       context: ./airflow
       dockerfile: Dockerfile
       target: airflow-browser
-
-    profiles:
-      - browser-scraping
 
     command:
       - celery

@@ -68,6 +68,8 @@ class ObjectStore(RawObjectReader, Protocol):
         content_type: str = "application/octet-stream",
     ) -> Mapping[str, str]: ...
 
+    def list_objects(self, bucket: str, prefix: str) -> list[str]: ...
+
 
 class Transformer(Protocol):
     def transform(

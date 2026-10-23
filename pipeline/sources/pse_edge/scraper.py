@@ -558,13 +558,21 @@ def _capture_calendar_history(
 
 
 def configured_rss_feeds() -> list[str]:
-    """Return the ordered, deduplicated RSS/Atom feed URLs from configuration."""
+    """Return configured RSS/Atom feeds hosted by the PSE EDGE domain."""
     feeds = [
         item.strip()
-        for item in os.getenv("PSE_RSS_FEEDS", "https://www.pse.com.ph/feed/").split(",")
+        for item in os.getenv("PSE_EDGE_RSS_FEEDS", "").split(",")
         if item.strip()
     ]
-    return list(dict.fromkeys(feeds))
+    unique_feeds = list(dict.fromkeys(feeds))
+    edge_host = (urlparse(BASE_URL).hostname or "").lower()
+    invalid = [url for url in unique_feeds if (urlparse(url).hostname or "").lower() != edge_host]
+    if invalid:
+        raise ValueError(
+            "PSE_EDGE_RSS_FEEDS must use the configured PSE EDGE host "
+            f"{edge_host!r}; route pse.com.ph feeds through the PSE website connector"
+        )
+    return unique_feeds
 
 
 def scrape(
@@ -866,11 +874,16 @@ def _scrape_with_client(
         if scope == "rss"
         else []
     )
+    edge_host = (urlparse(BASE_URL).hostname or "").lower()
+    if any((urlparse(url).hostname or "").lower() != edge_host for url in rss_feeds):
+        raise ValueError(
+            f"PSE EDGE RSS feeds must use {edge_host!r}; use the PSE website source for other hosts"
+        )
     if scope == "rss" and not rss_feeds:
         failures.append({
             "dataset": "rss",
             "url": "",
-            "error": "PSE_RSS_FEEDS contains no feed URLs",
+            "error": "PSE_EDGE_RSS_FEEDS contains no feed URLs",
             "required": scope == "rss",
             "sequence": 19_999,
         })

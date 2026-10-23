@@ -18,12 +18,13 @@ class PSEWebsiteConnector:
             raise ValueError(f"Expected source {self.name!r}; received {request.source!r}")
         result = crawl_public_site(
             run_id=request.run_id,
+            scope=request.scope,
             options=dict(request.options),
             object_store=self.object_store,
         )
         return ManifestRef(
             source=self.name,
-            scope=request.scope,
+            scope=result["scope"],
             run_id=result["run_id"],
             bucket=result["bucket"],
             key=result["manifest_key"],

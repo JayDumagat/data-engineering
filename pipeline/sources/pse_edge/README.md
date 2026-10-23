@@ -24,7 +24,7 @@ PSE EDGE's footer states that its materials may be accessed and downloaded only 
 
 - `pse_edge_full_ingestion` runs the named current-state jobs on weekdays at 03:15 Asia/Manila. Airflow maps one capture-transform-load group per domain, with independent retries, run IDs, manifests, storage objects, and warehouse audits. The default scheduled set excludes issuer profiles, historical stock/calendar views, and the unfiltered company-disclosure archive.
 - Trigger `pse_edge_full_ingestion` with `{"jobs": ["all"]}` to map the full backfill into independent domain capture-transform-load paths, with date filters open. The set avoids duplicate directory/profile pulls by sourcing those records through `company_market_history`. `{"jobs": ["configured_sources"]}` remains available as a single-scope full capture. For focused backfills, run a named job with `{"jobs": ["financial_reports"], "full_history": true}` or run `company_disclosures`, `company_profiles`, `company_market_history`, or `market_calendar_archive`.
-- `pse_edge_rss_ingestion` is a separate 15-minute lane for configured PSE website RSS/Atom feeds. It is outside the PSE EDGE catalog.
+- RSS from `www.pse.com.ph` is captured by `pse_website_rss_ingestion` and loaded into the `pse_website` schema. The optional PSE EDGE RSS scope accepts only feeds on the configured EDGE host.
 - `pse_edge_analytics` runs dbt after successful PSE EDGE, RSS, or PSE website warehouse loads.
 
 The capture client uses pooled Scrapling sessions, form-encoded POSTs for PSE EDGE's AJAX searches, bounded concurrent batches, and one shared request pace across workers. Scheduled search jobs use a 14-day overlap where the source supports date filters; the full-catalog scope leaves dates blank to backfill all available history. It does not work around anti-bot challenges. A challenge or access-denied response is recorded as a failed source request.
@@ -44,14 +44,14 @@ Add the public route or `SearchSource` request shape to `catalog.py`, then assig
 | Data | Destination | Notes |
 | --- | --- | --- |
 | Original HTML, JSON, RSS/XML, PDFs, images, videos, and other attachments | `raw` object-store bucket | Immutable source response bytes |
-| Normalized records | `stage` object-store bucket | Zstandard Parquet partitioned by source, dataset, and run |
-| Deduplicated records | `curated` object-store bucket | Latest row per `(dataset, record_key)` in the run |
-| Searchable records and ingestion audit | PostgreSQL `pse_edge` schema | JSONB payload, stable key, object reference, first/last-seen times |
+| Normalized records | `stage` object-store bucket | Silver Zstandard Parquet run deltas, deduplicated by `(dataset, record_key)` per run |
+| Curated current records | `curated` object-store bucket | One globally deduplicated `current.parquet` per source and dataset under `curated/current/` |
+| Searchable records and ingestion audit | PostgreSQL `pse_edge` schema | Unique `(dataset, record_key)`, full JSONB payload, typed search fields, object pointers, first/last-seen times |
 | Transform errors | `quarantine` object-store bucket | JSON diagnostics retained for replay |
 | Airflow task logs | `airflow-logs` object-store bucket | Remote S3 logs plus local task copies |
-| Analytics models | PostgreSQL `analytics` schema | dbt views over warehouse tables |
+| Analytics models | PostgreSQL `analytics` schema | dbt staging views and materialized fact tables |
 
-`DatasetRouter` sends attachment metadata and binary-asset metadata to object storage only. Original bytes stay in the raw bucket; other normalized records go to Parquet and PostgreSQL.
+`DatasetRouter` sends attachment metadata and binary-asset metadata to object storage only. Original bytes stay in the raw bucket. Warehouse loads use each run's stage delta, while curated snapshots merge new records with prior records by stable key. Existing per-run curated Parquet objects are folded into the first current snapshot automatically.
 
 ## Configuration
 
@@ -73,7 +73,7 @@ All `PSE_MAX_*` variables default to `0`, which means no application-level cap. 
 | `PSE_EDGE_JOB_SLOTS` | `2` | Source-pool slots and workers reserved by each mapped job |
 | `PSE_EDGE_JOBS` | Default current-state jobs | Optional comma-separated set of scheduled domain jobs |
 | `PSE_EDGE_SEARCH_WINDOW_DAYS` | Job default; `0` means unbounded | Override the rolling date window for jobs with date filters |
-| `PSE_RSS_FEEDS` | `https://www.pse.com.ph/feed/` | Separate comma-separated RSS/Atom feed list |
+| `PSE_EDGE_RSS_FEEDS` | empty | Optional RSS/Atom feed URLs hosted on the PSE EDGE domain |
 | `PSE_ETL_WORKERS` | `4` | Concurrent raw-object reads and transforms |
 | `S3_BUCKET_RAW` | `raw` | Immutable responses and source manifests |
 | `S3_BUCKET_STAGE` | `stage` | Normalized Parquet objects and ETL manifests |

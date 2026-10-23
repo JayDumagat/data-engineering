@@ -4,3 +4,7 @@ airflow/logs/
 dbt/logs/
 dbt/target/
 dbt/dbt_packages/
+web/node_modules/
+web/.next/
+web/out/
+web/npm-debug.log*

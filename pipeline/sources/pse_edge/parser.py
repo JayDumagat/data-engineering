@@ -27,6 +27,9 @@ class _TableParser(HTMLParser):
         self._skip_depth = 0
         self._in_title = False
         self.title_parts: list[str] = []
+        self._in_heading = False
+        self._heading_parts: list[str] = []
+        self._last_heading = ""
         self.form_fields: list[dict[str, Any]] = []
         self._select_name = ""
 
@@ -59,10 +62,13 @@ class _TableParser(HTMLParser):
             )
         if tag.lower() == "title":
             self._in_title = True
+        if tag.lower() in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            self._in_heading = True
+            self._heading_parts = []
         if tag.lower() == "table":
             self._table_depth += 1
             if self._table_depth == 1:
-                self._table = {"rows": []}
+                self._table = {"rows": [], "title": self._last_heading}
         elif self._table_depth == 1 and tag.lower() == "tr":
             self._row = {"cells": []}
         elif self._table_depth == 1 and tag.lower() in {"th", "td"} and self._row is not None:
@@ -107,6 +113,11 @@ class _TableParser(HTMLParser):
             self._select_name = ""
         if tag == "title":
             self._in_title = False
+        if tag in {"h1", "h2", "h3", "h4", "h5", "h6"} and self._in_heading:
+            heading = _clean(" ".join(self._heading_parts))
+            if heading:
+                self._last_heading = heading
+            self._in_heading = False
         if tag == "table" and self._table_depth:
             self._table_depth -= 1
             if self._table_depth == 0 and self._table is not None:
@@ -127,6 +138,8 @@ class _TableParser(HTMLParser):
             return
         if self._in_title:
             self.title_parts.append(data)
+        if self._in_heading:
+            self._heading_parts.append(data)
         if data.strip():
             self.text_parts.append(data.strip())
         if self._cell is not None:
@@ -203,6 +216,7 @@ def parse_html_records(html: str, dataset: str, source_url: str) -> tuple[list[d
                     "record_type": "table_row",
                     "table_no": table_no,
                     "row_no": row_no,
+                    "table_title": table.get("title", ""),
                     "columns": columns,
                     "cells": values,
                     "links": cell_links,

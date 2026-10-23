@@ -12,6 +12,7 @@ import re
 from pipeline.core.contracts import ManifestRef, ObjectStore, RunContext
 from pipeline.etl.extract import read_manifest
 from pipeline.etl.load import load_to_sinks
+from pipeline.etl.merge import deduplicate_frame
 from pipeline.etl.pse_edge.transformer import PSEEdgeTransformer
 from pipeline.etl.quality import records_to_frame
 from pipeline.etl.routing import DatasetRouter
@@ -100,12 +101,10 @@ def transform_to_lake(
         if outcome.failure:
             transform_failures.append(outcome.failure)
 
-    stage_frame = records_to_frame(records)
-    curated_frame = stage_frame.unique(
-        subset=["dataset", "record_key"],
-        keep="last",
-        maintain_order=True,
-    )
+    # Silver is deduplicated within this extraction run. The curated Parquet
+    # sink also merges these deltas into one globally deduplicated current view.
+    stage_frame = deduplicate_frame(records_to_frame(records))
+    curated_frame = stage_frame
     router = DatasetRouter()
     stage_bucket = os.getenv("S3_BUCKET_STAGE", "stage")
     curated_bucket = os.getenv("S3_BUCKET_CURATED", "curated")
@@ -223,11 +222,19 @@ def load_curated(
         postgres_sink = PostgresRecordSink(engine=engine, ensure_schema=False)
         sinks = SinkRegistry([postgres_sink])
         warehouse_records = 0
-        curated_objects = manifest.get("outputs", {}).get("curated_parquet", [])
-        for curated_object in curated_objects:
-            curated_frame = read_parquet_objects([curated_object], object_store)
+        run_objects = manifest.get("outputs", {}).get("stage_parquet", [])
+        if not run_objects:
+            # Backward compatibility with manifests created before stage deltas
+            # became the warehouse load input.
+            run_objects = [
+                item
+                for item in manifest.get("outputs", {}).get("curated_parquet", [])
+                if item.get("role") != "snapshot"
+            ]
+        for run_object in run_objects:
+            run_frame = read_parquet_objects([run_object], object_store)
             load_results = load_to_sinks(
-                curated_frame,
+                run_frame,
                 context=context,
                 sinks=sinks,
                 router=DatasetRouter(),

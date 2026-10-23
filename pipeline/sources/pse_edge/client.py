@@ -108,6 +108,53 @@ class PSEHTTPClient:
     def get(self, url: str, headers: dict[str, str] | None = None) -> Any:
         return self._request("GET", url, headers=headers)
 
+    def get_dynamic(
+        self,
+        url: str,
+        *,
+        wait_selector: str,
+        page_action: Callable[[Any], Any] | None = None,
+    ) -> Any:
+        """Fetch one JavaScript-rendered source page with bounded retries."""
+        if self._executor is None:
+            raise RuntimeError("PSEHTTPClient must be used inside a with block")
+
+        from scrapling.fetchers import DynamicFetcher
+
+        last_error: Exception | None = None
+        for attempt in range(3):
+            self._pace()
+            try:
+                response = DynamicFetcher.fetch(
+                    url,
+                    useragent=self.user_agent,
+                    timeout=60_000,
+                    wait=500,
+                    disable_resources=True,
+                    wait_selector=wait_selector,
+                    wait_selector_state="visible",
+                    google_search=False,
+                    page_action=page_action,
+                )
+                status = int(getattr(response, "status", 200) or 200)
+                if status >= 400:
+                    raise RuntimeError(f"HTTP {status} for {url}")
+                return response
+            except Exception as exc:
+                last_error = exc
+                if attempt < 2:
+                    wait_seconds = 2**attempt
+                    LOGGER.warning(
+                        "Retrying dynamic PSE request: url=%s attempt=%d wait_seconds=%d error=%s",
+                        url,
+                        attempt + 2,
+                        wait_seconds,
+                        exc,
+                    )
+                    time.sleep(wait_seconds)
+
+        raise RuntimeError(f"Could not render {url}: {last_error}") from last_error
+
     def post(
         self,
         url: str,

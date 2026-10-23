@@ -9,3 +9,5 @@ clean-targets: ["target", "dbt_packages"]
 models:
   pse_edge_analytics:
     +materialized: view
+    marts:
+      +materialized: table

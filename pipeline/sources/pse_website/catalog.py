@@ -10,25 +10,16 @@ PAGE_HOSTS = frozenset({"www.pse.com.ph", "pse.com.ph"})
 DOCUMENT_HOSTS = frozenset({"documents.pse.com.ph"})
 ALLOWED_HOSTS = PAGE_HOSTS | DOCUMENT_HOSTS
 
-# Focused entry points cover the main public information areas. Sitemaps add
-# pages the public navigation does not expose directly.
-SEED_PATHS = (
-    "/",
-    "/news_announcement/",
-    "/press-room-archive/",
-    "/news-and-announcement-archive/",
-    "/market-report/",
-    "/data-products/",
-    "/listed-company-directory/",
-    "/listing-statistics/",
-    "/investing-at-pse/",
-    "/feed/",
-    "/wp-sitemap.xml",
-    "/sitemap_index.xml",
-    "/sitemap.xml",
-)
-
-SITEMAP_PATHS = ("/wp-sitemap.xml", "/sitemap_index.xml", "/sitemap.xml")
+# Collect records from PSE's data pages and publication archives. Broad site
+# navigation and sitemaps contain menus, legal pages, and unrelated material.
+PAGE_DATASETS = {
+    "/market-report/": "market_reports",
+    "/news-and-announcement-archive/": "announcements",
+    "/press-room-archive/": "press_releases",
+    "/listing-statistics/": "listing_statistics",
+}
+SEED_PATHS = tuple(PAGE_DATASETS)
+DYNAMIC_DATASETS = frozenset(PAGE_DATASETS.values())
 ASSET_SUFFIXES = frozenset(
     {
         ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".zip",

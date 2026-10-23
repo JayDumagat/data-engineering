@@ -12,8 +12,7 @@ from pipeline.sources.pse_website.connector import PSEWebsiteConnector
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--max-pages", type=int, default=3000)
-    parser.add_argument("--max-assets", type=int, default=3000)
+    parser.add_argument("--max-pages", type=int, default=10)
     parser.add_argument("--workers", type=int, default=4)
     args = parser.parse_args()
     run_id = f"manual__{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
@@ -24,7 +23,6 @@ def main() -> None:
             run_id=run_id,
             options={
                 "max_pages": args.max_pages,
-                "max_assets": args.max_assets,
                 "max_concurrency": args.workers,
             },
         )

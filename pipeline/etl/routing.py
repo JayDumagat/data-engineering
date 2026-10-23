@@ -20,6 +20,8 @@ class DatasetRouter:
             # searchable metadata in the lake instead of copying it into SQL.
             "disclosure_documents": frozenset({"stage_parquet", "curated_parquet"}),
             "disclosure_assets": frozenset({"stage_parquet", "curated_parquet"}),
+            "website_pages": frozenset({"stage_parquet", "curated_parquet"}),
+            "website_sitemaps": frozenset({"stage_parquet", "curated_parquet"}),
             "website_assets": frozenset({"stage_parquet", "curated_parquet"}),
             "website_crawl_controls": frozenset({"stage_parquet", "curated_parquet"}),
         }
@@ -29,6 +31,12 @@ class DatasetRouter:
             "binary_asset": frozenset({"stage_parquet", "curated_parquet"}),
             "image_asset": frozenset({"stage_parquet", "curated_parquet"}),
             "video_asset": frozenset({"stage_parquet", "curated_parquet"}),
+            "page_snapshot": frozenset({"stage_parquet", "curated_parquet"}),
+            "outbound_link": frozenset({"stage_parquet", "curated_parquet"}),
+            "sitemap_url": frozenset({"stage_parquet", "curated_parquet"}),
+            "robots_policy": frozenset({"stage_parquet", "curated_parquet"}),
+            "crawl_summary": frozenset({"stage_parquet", "curated_parquet"}),
+            "source_table_row": frozenset({"stage_parquet", "curated_parquet"}),
         }
     )
 

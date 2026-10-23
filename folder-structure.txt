@@ -1,7 +1,7 @@
 data-engineering/
 ├── .env                              # local credentials and service settings (never commit)
 ├── .gitignore                        # bytecode, local Airflow logs, and generated dbt files
-├── docker-compose.yml                # Airflow, Redis, Postgres, and SeaweedFS services
+├── docker-compose.yml                # Airflow, warehouse, object storage, and Next.js viewer
 ├── folder-structure.txt
 ├── airflow/
 │   ├── Dockerfile                    # Airflow image, providers, and pipeline libraries
@@ -50,6 +50,17 @@ data-engineering/
 │   └── storage/
 │       ├── object_storage.py          # ObjectStore factory and pooled S3 adapter
 │       └── warehouse.py               # PostgreSQL schema, upserts, and run audit
-└── tools/
-    ├── pse_edge_fetch.py              # full-catalog or focused PSE EDGE capture utility
-    └── pse_website_fetch.py           # optional bounded PSE website capture
+├── tools/
+│   ├── pse_edge_fetch.py              # full-catalog or focused PSE EDGE capture utility
+│   └── pse_website_fetch.py           # optional bounded PSE website capture
+└── web/
+    ├── Dockerfile                     # standalone Next.js production image
+    ├── app/
+    │   ├── api/                       # read-only warehouse API routes
+    │   ├── globals.css                # responsive observatory interface
+    │   ├── layout.tsx                 # app metadata and shared layout
+    │   └── page.tsx                   # Next.js App Router entry point
+    ├── components/
+    │   └── data-explorer.tsx          # source switcher, metrics, records, run history
+    └── lib/
+        └── db.ts                      # pooled PostgreSQL warehouse connection

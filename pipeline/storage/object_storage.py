@@ -93,6 +93,16 @@ class S3ObjectStore:
     ) -> dict[str, str]:
         return upload_bytes(bucket=bucket, key=key, data=body, content_type=content_type)
 
+    def list_objects(self, bucket: str, prefix: str) -> list[str]:
+        """List keys under a prefix for one-time lake compaction/bootstrap jobs."""
+        client = get_s3_client()
+        paginator = client.get_paginator("list_objects_v2")
+        return [
+            str(item["Key"])
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix)
+            for item in page.get("Contents", [])
+        ]
+
 
 def get_object_store() -> ObjectStore:
     """Create the default S3-compatible adapter for pipeline flows."""

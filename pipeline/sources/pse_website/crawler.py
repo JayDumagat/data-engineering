@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from html.parser import HTMLParser
 from mimetypes import guess_extension, guess_type
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
@@ -22,11 +21,11 @@ from pipeline.sources.pse_edge.parser import parse_html_records, parse_rss_recor
 from pipeline.sources.pse_website.catalog import (
     ALLOWED_HOSTS,
     BASE_URL,
-    DOCUMENT_HOSTS,
+    DYNAMIC_DATASETS,
+    PAGE_DATASETS,
     PAGE_HOSTS,
     PAGE_QUERY_KEYS,
     SEED_PATHS,
-    SITEMAP_PATHS,
     host_allowed,
     is_asset_url,
 )
@@ -34,10 +33,9 @@ from pipeline.storage.object_storage import get_object_store
 
 
 LOGGER = logging.getLogger(__name__)
-STATE_KEY = "pse_website/state/crawl_index.json"
+STATE_KEY = "pse_website/state/crawl_index_v2.json"
 MANILA = ZoneInfo("Asia/Manila")
 MAX_PAGE_LIMIT = 10_000
-MAX_ASSET_LIMIT = 10_000
 
 
 def _bounded_int(value: Any, default: int, maximum: int) -> int:
@@ -103,53 +101,12 @@ def normalize_url(url: str, base: str | None = None) -> str | None:
 
 def _likely_page(url: str) -> bool:
     parsed = urlparse(url)
-    if parsed.hostname in PAGE_HOSTS:
-        if is_asset_url(url):
-            return False
-        if parsed.path.lower().endswith((".php", ".json", ".js", ".css", ".txt")):
-            return False
-        if any(token in parsed.path.lower() for token in ("/wp-admin", "/wp-login", "/wp-json/", "/api/")):
-            return False
-        return True
-    return parsed.hostname in DOCUMENT_HOSTS and is_asset_url(url)
+    return parsed.hostname in PAGE_HOSTS and not is_asset_url(url)
 
 
-class _LocParser(HTMLParser):
-    """Extract sitemap loc/lastmod pairs without loading a sitemap library."""
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.entries: list[dict[str, str]] = []
-        self._entry: dict[str, str] | None = None
-        self._field: str | None = None
-        self._parts: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        name = tag.rsplit(":", 1)[-1].lower()
-        if name in {"url", "sitemap"}:
-            self._entry = {}
-        elif name in {"loc", "lastmod"} and self._entry is not None:
-            self._field = name
-            self._parts = []
-
-    def handle_data(self, data: str) -> None:
-        if self._field:
-            self._parts.append(data)
-
-    def handle_endtag(self, tag: str) -> None:
-        name = tag.rsplit(":", 1)[-1].lower()
-        if name == self._field and self._entry is not None:
-            self._entry[name] = "".join(self._parts).strip()
-            self._field = None
-        elif name in {"url", "sitemap"} and self._entry:
-            if self._entry.get("loc"):
-                self.entries.append(self._entry)
-            self._entry = None
-
-
-def _read_state(store: ObjectStore, bucket: str) -> dict[str, Any]:
+def _read_state(store: ObjectStore, bucket: str, key: str = STATE_KEY) -> dict[str, Any]:
     try:
-        return json.loads(store.read(bucket, STATE_KEY))
+        return json.loads(store.read(bucket, key))
     except Exception:
         return {"schema_version": 1, "urls": {}, "robots": {}}
 
@@ -201,42 +158,316 @@ def _inline_descriptor(
     }
 
 
+def configured_website_rss_feeds() -> list[str]:
+    """Return validated PSE-hosted RSS/Atom feeds for the website source."""
+    configured = os.getenv("PSE_WEBSITE_RSS_FEEDS", f"{BASE_URL}/feed/")
+    feeds = list(dict.fromkeys(item.strip() for item in configured.split(",") if item.strip()))
+    for feed_url in feeds:
+        normalized = normalize_url(feed_url)
+        if not normalized or (urlparse(normalized).hostname or "").lower() not in PAGE_HOSTS:
+            raise ValueError(f"PSE website RSS feed must be on an official PSE page host: {feed_url}")
+    return feeds
+
+
+def _extract_market_report_rows(page: Any, request_delay_seconds: float) -> list[dict[str, Any]]:
+    """Read the rendered PSE report table, including all paginated rows."""
+    table_selector = "table[id^='ptp_']"
+    page.wait_for_selector(f"{table_selector} tbody tr", state="visible", timeout=60_000)
+    table = page.locator(table_selector).first
+    table_id = table.get_attribute("id")
+    if not table_id:
+        raise RuntimeError("PSE market report table has no stable table id")
+
+    header_locator = table.locator("thead tr").last.locator("th")
+    headers = [value.strip() for value in header_locator.all_text_contents()]
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def collect_visible_rows() -> None:
+        visible_rows = table.locator("tbody tr").evaluate_all(
+            """elements => elements.map(row => ({
+                cells: Array.from(row.querySelectorAll('td')).map(cell =>
+                    (cell.innerText || cell.textContent || '').replace(/\\s+/g, ' ').trim()
+                ),
+                links: Array.from(row.querySelectorAll('a[href]')).map(link => ({
+                    text: (link.innerText || link.textContent || '').replace(/\\s+/g, ' ').trim(),
+                    href: link.href,
+                    onclick: link.getAttribute('onclick') || ''
+                }))
+            }))"""
+        )
+        for row in visible_rows:
+            values = row.get("cells", [])
+            if not values or not any(str(value).strip() for value in values):
+                continue
+            columns = {
+                (headers[index] if index < len(headers) and headers[index] else f"column_{index + 1}"): value
+                for index, value in enumerate(values)
+            }
+            links = row.get("links", [])
+            download_url = next((str(link.get("href", "")).strip() for link in links if link.get("href")), "")
+            identity = download_url or json.dumps(columns, ensure_ascii=False, sort_keys=True)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            normalized_columns = {str(key).strip().casefold(): value for key, value in columns.items()}
+            report_title = next(
+                (
+                    str(normalized_columns[key]).strip()
+                    for key in ("report type", "title", "report")
+                    if normalized_columns.get(key) and str(normalized_columns[key]).strip()
+                ),
+                "PSE market report",
+            )
+            rows.append({
+                "record_type": "table_row",
+                "title": report_title,
+                "columns": columns,
+                "links": links,
+                "download_url": download_url or None,
+                "row_no": len(rows) + 1,
+            })
+
+    length_select = page.locator(f"#{table_id}_length")
+    if length_select.count():
+        try:
+            length_select.select_option("100", timeout=5_000)
+            page.wait_for_function(
+                """({tableId, expected}) => {
+                    const table = document.getElementById(tableId);
+                    return table && table.querySelectorAll('tbody tr').length >= expected;
+                }""",
+                arg={"tableId": table_id, "expected": 50},
+                timeout=30_000,
+            )
+        except Exception:
+            # Some source versions expose only 10/25/50 rows per page.
+            page.wait_for_timeout(max(500, int(request_delay_seconds * 1_000)))
+
+    next_button = page.locator(f"#{table_id}_next")
+    for _ in range(1_000):
+        collect_visible_rows()
+        if not next_button.count():
+            break
+        classes = (next_button.get_attribute("class") or "").casefold()
+        if "disabled" in classes or (next_button.get_attribute("aria-disabled") or "").casefold() == "true":
+            break
+        first_row = table.locator("tbody tr").first.inner_text().strip()
+        next_button.click(timeout=10_000)
+        page.wait_for_function(
+            """({tableId, previous}) => {
+                const row = document.querySelector(`#${CSS.escape(tableId)} tbody tr`);
+                return row && row.innerText.trim() !== previous;
+            }""",
+            arg={"tableId": table_id, "previous": first_row},
+            timeout=30_000,
+        )
+        page.wait_for_timeout(max(500, int(request_delay_seconds * 1_000)))
+    else:
+        raise RuntimeError("PSE Market Reports pagination exceeded the 1,000-page safety cap")
+
+    if not rows:
+        raise RuntimeError("PSE Market Reports page rendered a table but returned no report rows")
+    return rows
+
+
+def _extract_dynamic_table_rows(
+    page: Any,
+    dataset: str,
+    request_delay_seconds: float,
+) -> list[dict[str, Any]]:
+    """Capture every rendered row from archive/statistics tables and their pages."""
+    page.wait_for_selector("table tbody tr", state="visible", timeout=60_000)
+    tables = page.locator("table:visible")
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for table_no in range(tables.count()):
+        table = tables.nth(table_no)
+        table_id = table.get_attribute("id") or ""
+        page_no = 0
+        for _ in range(1_000):
+            page_no += 1
+            captured = table.evaluate(
+                """table => {
+                    const text = element => (element?.innerText || element?.textContent || '')
+                        .replace(/\\s+/g, ' ').trim();
+                    const heading = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6'))
+                        .filter(item => item.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING)
+                        .at(-1);
+                    const caption = text(table.querySelector('caption'));
+                    const headerRow = table.querySelector('thead tr:last-child')
+                        || Array.from(table.querySelectorAll('tr')).find(row => row.querySelectorAll('th').length);
+                    const headers = headerRow
+                        ? Array.from(headerRow.querySelectorAll('th,td')).map(text)
+                        : [];
+                    const bodyRows = Array.from(table.querySelectorAll('tbody tr'));
+                    return {
+                        title: caption || text(heading),
+                        headers,
+                        rows: bodyRows.map(row => ({
+                            cells: Array.from(row.querySelectorAll('th,td')).map(text),
+                            links: Array.from(row.querySelectorAll('a[href],button[onclick]')).map(link => ({
+                                text: text(link),
+                                href: link.href || '',
+                                onclick: link.getAttribute('onclick') || ''
+                            })),
+                            attributes: Object.fromEntries(Array.from(row.attributes)
+                                .filter(attribute => attribute.name.startsWith('data-'))
+                                .map(attribute => [attribute.name, attribute.value]))
+                        }))
+                    };
+                }"""
+            )
+            headers = [str(value).strip() for value in captured.get("headers", [])]
+            table_title = str(captured.get("title", "")).strip()
+            visible_rows = captured.get("rows", [])
+            if not visible_rows:
+                break
+
+            first_row_text = " ".join(str(value).strip() for value in visible_rows[0].get("cells", []))
+            for row in visible_rows:
+                values = [str(value).strip() for value in row.get("cells", [])]
+                if not values or not any(values):
+                    continue
+                columns = {
+                    (headers[index] if index < len(headers) and headers[index] else f"column_{index + 1}"): value
+                    for index, value in enumerate(values)
+                }
+                links = row.get("links", [])
+                identity = next(
+                    (str(link.get("href", "")).strip() for link in links if link.get("href")),
+                    json.dumps(
+                        {"table_title": table_title, "columns": columns},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                )
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                rows.append(
+                    {
+                        "record_type": "table_row",
+                        "dataset": dataset,
+                        "table_no": table_no + 1,
+                        "table_title": table_title,
+                        "row_no": len(rows) + 1,
+                        "source_page": page_no,
+                        "columns": columns,
+                        "cells": values,
+                        "links": links,
+                        "source_attributes": row.get("attributes", {}),
+                    }
+                )
+
+            next_clicked = page.evaluate(
+                """({tableIndex, tableId}) => {
+                    const visibleTables = Array.from(document.querySelectorAll('table'))
+                        .filter(element => element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+                    const table = (tableId && document.getElementById(tableId)) || visibleTables[tableIndex];
+                    const wrapper = table?.closest('.dataTables_wrapper')
+                        || table?.closest('section, main')
+                        || document;
+                    const selectors = [
+                        tableId ? `#${CSS.escape(tableId)}_next` : '',
+                        '.dataTables_paginate .paginate_button.next',
+                        '.pagination a[aria-label="Next"]',
+                        '.pagination button[aria-label="Next"]',
+                        'a[rel="next"]'
+                    ].filter(Boolean);
+                    let button = null;
+                    for (const selector of selectors) {
+                        button = wrapper.querySelector(selector);
+                        if (button) break;
+                    }
+                    if (!button) return false;
+                    const classes = (button.className || '').toString().toLowerCase();
+                    if (button.disabled || button.getAttribute('aria-disabled') === 'true'
+                        || classes.includes('disabled')) return false;
+                    button.click();
+                    return true;
+                }""",
+                {"tableIndex": table_no, "tableId": table_id},
+            )
+            if not next_clicked:
+                break
+
+            old_count = len(rows)
+            try:
+                page.wait_for_function(
+                    """({tableIndex, tableId, previous}) => {
+                        const visibleTables = Array.from(document.querySelectorAll('table'))
+                            .filter(element => element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+                        const table = (tableId && document.getElementById(tableId)) || visibleTables[tableIndex];
+                        const row = table?.querySelector('tbody tr');
+                        return row && row.innerText.trim() !== previous;
+                    }""",
+                    arg={"tableIndex": table_no, "tableId": table_id, "previous": first_row_text},
+                    timeout=30_000,
+                )
+            except Exception:
+                # Avoid a duplicate loop when a site's next control is present but inert.
+                if len(rows) == old_count:
+                    break
+            page.wait_for_timeout(max(500, int(request_delay_seconds * 1_000)))
+        else:
+            raise RuntimeError(f"PSE {dataset} pagination exceeded the 1,000-page safety cap")
+
+    if not rows:
+        raise RuntimeError(f"PSE {dataset} rendered tables but returned no non-empty rows")
+    return rows
+
+
 def crawl_public_site(
     *,
     run_id: str,
+    scope: str = "public_site",
     options: dict[str, Any] | None = None,
     object_store: ObjectStore | None = None,
 ) -> dict[str, Any]:
-    """Capture public HTML, sitemaps, feeds and linked files to immutable raw storage."""
+    """Capture focused PSE data pages or RSS feeds to immutable raw storage."""
     options = options or {}
+    if scope not in {"public_site", "rss"}:
+        raise ValueError(f"Unsupported PSE Website crawl scope: {scope}")
     started_at = datetime.now(timezone.utc)
     ingest_local = started_at.astimezone(MANILA)
     run_segment = re.sub(r"[^A-Za-z0-9_.=-]+", "_", run_id).strip("_") or uuid.uuid4().hex
-    max_pages = _bounded_int(options.get("max_pages", os.getenv("PSE_WEBSITE_MAX_PAGES", "3000")), 3000, MAX_PAGE_LIMIT)
-    max_assets = _bounded_int(options.get("max_assets", os.getenv("PSE_WEBSITE_MAX_ASSETS", "3000")), 3000, MAX_ASSET_LIMIT)
+    max_pages = _bounded_int(options.get("max_pages", os.getenv("PSE_WEBSITE_MAX_PAGES", "10")), 10, MAX_PAGE_LIMIT)
+    max_assets = 0
     worker_limit = options.get("max_concurrency")
     worker_limit = _bounded_int(worker_limit, 4, 16) if worker_limit is not None else None
+    if scope == "public_site":
+        worker_limit = min(worker_limit or 2, 2)
     bucket = os.getenv("S3_BUCKET_RAW", "raw")
     store = object_store if object_store is not None else get_object_store()
-    previous = _read_state(store, bucket)
+    state_key = STATE_KEY.replace(".json", f"_{scope}.json")
+    previous = _read_state(store, bucket, state_key)
     old_urls = previous.get("urls", {}) if isinstance(previous, dict) else {}
     if not isinstance(old_urls, dict):
         old_urls = {}
-    pending_urls = previous.get("frontier", []) if isinstance(previous, dict) else []
-    if not isinstance(pending_urls, list):
-        pending_urls = []
     objects: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     robots: dict[str, RobotFileParser] = {}
     robots_text: dict[str, str] = {}
-    sitemap_urls: list[str] = []
+    robots_unavailable_hosts: set[str] = set()
     base_url = os.getenv("PSE_WEBSITE_BASE_URL", BASE_URL).rstrip("/")
     base_host = (urlparse(base_url).hostname or "").lower()
     if base_host not in PAGE_HOSTS:
         raise ValueError(f"PSE_WEBSITE_BASE_URL must use one of the official page hosts: {sorted(PAGE_HOSTS)}")
+    configured_feeds = options.get("feed_urls")
+    feed_urls = configured_feeds if configured_feeds is not None else configured_website_rss_feeds()
+    if isinstance(feed_urls, str):
+        feed_urls = [feed_urls]
+    normalized_feeds = [normalize_url(str(item)) for item in feed_urls]
+    if any(normalized is None for normalized in normalized_feeds):
+        raise ValueError("Every PSE website RSS feed URL must use an official PSE page host")
+    feed_urls = list(dict.fromkeys(normalized for normalized in normalized_feeds if normalized))
+    if scope == "rss" and not feed_urls:
+        raise ValueError("PSE_WEBSITE_RSS_FEEDS must contain at least one official PSE RSS feed")
     user_agent = os.getenv("PSE_WEBSITE_USER_AGENT", "Mozilla/5.0 (compatible; PSEPublicResearch/1.0)")
 
-    LOGGER.info("PSE public website crawl started: run_id=%s max_pages=%d max_assets=%d", run_id, max_pages, max_assets)
+    LOGGER.info("PSE website capture started: run_id=%s scope=%s max_pages=%d", run_id, scope, max_pages)
     with PSEHTTPClient(
         worker_limit=worker_limit,
         base_url=base_url,
@@ -244,15 +475,17 @@ def crawl_public_site(
         concurrency_env="PSE_WEBSITE_CONCURRENCY",
         delay_env="PSE_WEBSITE_REQUEST_DELAY_SECONDS",
     ) as client:
-        for host in sorted(ALLOWED_HOSTS):
+        feed_hosts = {urlparse(url).hostname for url in feed_urls}
+        robots_hosts = feed_hosts if scope == "rss" else {base_host}
+        robots_disallowed_count = 0
+        for host in sorted(host for host in robots_hosts if host):
             try:
-                robots[host], robots_text[host], host_sitemaps = _robots_for_host(client, host)
-                sitemap_urls.extend(host_sitemaps)
+                robots[host], robots_text[host], _ = _robots_for_host(client, host)
             except Exception as exc:
-                failures.append({"dataset": "crawl_controls", "url": f"https://{host}/robots.txt", "error": str(exc), "required": host == base_host})
+                robots_unavailable_hosts.add(host)
+                failures.append({"dataset": "crawl_controls", "url": f"https://{host}/robots.txt", "error": str(exc), "required": True})
                 LOGGER.warning("Could not read PSE robots.txt: host=%s error=%s", host, exc)
 
-        page_robots = robots.get(base_host)
         robots_delay = max(
             (
                 policy.crawl_delay(user_agent) or policy.crawl_delay("*") or 0.0
@@ -265,58 +498,58 @@ def crawl_public_site(
             "PSE website crawl pacing configured: request_delay_seconds=%.2f",
             client.delay,
         )
-        seed_urls = [*pending_urls, *(f"{base_url}{path}" for path in SEED_PATHS)]
-        seed_urls.extend(sitemap_urls)
-        frontier = [url for raw_url in seed_urls if page_robots is not None and (url := normalize_url(raw_url)) and _likely_page(url)]
-        # Add a sitemap URL even if robots.txt did not advertise one.
-        frontier.extend(
-            url for path in SITEMAP_PATHS
-            if page_robots is not None
-            and (url := normalize_url(f"{base_url}{path}")) and url not in frontier
-        )
+        if scope == "rss":
+            seeds = [(url, "website_feeds") for url in feed_urls]
+        else:
+            seeds = [
+                (url, PAGE_DATASETS[path])
+                for path in SEED_PATHS
+                if (url := normalize_url(f"{base_url}{path}"))
+            ]
+            saved_frontier = previous.get("frontier", []) if isinstance(previous, dict) else []
+            if isinstance(saved_frontier, list):
+                for item in saved_frontier:
+                    if not isinstance(item, (list, tuple)) or len(item) != 2:
+                        continue
+                    saved_url = normalize_url(str(item[0]))
+                    if saved_url:
+                        seeds.append((saved_url, str(item[1])))
+        frontier = []
+        for url, dataset in seeds:
+            host = (urlparse(url).hostname or "").lower()
+            policy = robots.get(host)
+            if not _likely_page(url) or policy is None:
+                continue
+            if not _allowed(policy, url, user_agent):
+                robots_disallowed_count += 1
+                continue
+            frontier.append((url, dataset))
         visited: set[str] = set()
         next_state: dict[str, Any] = dict(old_urls)
-        sitemap_seen: set[str] = set()
         page_count = 0
-        asset_count = 0
         unchanged_count = 0
-        robots_disallowed_count = 0
         sequence = 0
+        asset_count = 0
+        sitemap_seen: set[str] = set()
 
-        while frontier and (page_count < max_pages or asset_count < max_assets):
+        while frontier and page_count < max_pages:
             batch: list[tuple[str, str]] = []
-            deferred: set[str] = set()
-            for url in frontier:
+            deferred: list[tuple[str, str]] = []
+            for url, dataset in frontier:
                 normalized = normalize_url(url)
                 if not normalized or normalized in visited or not _likely_page(normalized):
                     continue
-                host = (urlparse(normalized).hostname or "").lower()
-                policy = robots.get(host)
-                if policy is None or not _allowed(policy, normalized, user_agent):
-                    visited.add(normalized)
-                    robots_disallowed_count += 1
+                if page_count >= max_pages:
+                    deferred.append((normalized, dataset))
                     continue
-                if is_asset_url(normalized):
-                    if asset_count >= max_assets:
-                        deferred.add(normalized)
-                        continue
-                    asset_count += 1
-                    dataset = "website_assets"
-                else:
-                    if page_count >= max_pages:
-                        deferred.add(normalized)
-                        continue
-                    page_count += 1
-                    dataset = "website_sitemaps" if normalized.lower().endswith(".xml") or "sitemap" in normalized.lower() else (
-                        "website_feeds" if "/feed" in normalized.lower() else "website_pages"
-                    )
+                page_count += 1
                 visited.add(normalized)
                 batch.append((normalized, dataset))
             if not batch:
-                frontier = sorted(deferred)
+                frontier = deferred
                 break
 
-            def fetch_one(item: tuple[str, str]) -> tuple[str, str, Any | None, Exception | None]:
+            def fetch_one(item: tuple[str, str]) -> tuple[str, str, Any | None, Exception | None, list[dict[str, Any]]]:
                 url, dataset = item
                 prior = old_urls.get(url, {})
                 validators: dict[str, str] = {}
@@ -325,22 +558,42 @@ def crawl_public_site(
                 if prior.get("last_modified"):
                     validators["If-Modified-Since"] = prior["last_modified"]
                 try:
-                    return url, dataset, client.get(url, headers=validators or None), None
+                    if dataset in DYNAMIC_DATASETS:
+                        captured_rows: list[dict[str, Any]] = []
+                        is_market_report = dataset == "market_reports"
+
+                        def page_action(page: Any) -> None:
+                            if is_market_report:
+                                captured_rows.extend(_extract_market_report_rows(page, client.delay))
+                            else:
+                                captured_rows.extend(
+                                    _extract_dynamic_table_rows(page, dataset, client.delay)
+                                )
+
+                        response = client.get_dynamic(
+                            url,
+                            wait_selector="table[id^='ptp_'] tbody tr" if is_market_report else "table tbody tr",
+                            page_action=page_action,
+                        )
+                        return url, dataset, response, None, captured_rows
+                    return url, dataset, client.get(url, headers=validators or None), None, []
                 except Exception as exc:
-                    return url, dataset, None, exc
+                    return url, dataset, None, exc, []
 
             results = client.map(fetch_one, batch)
-            discovered: list[str] = []
-            for url, dataset, response, error in results:
+            for url, dataset, response, error, captured_rows in results:
                 if error is not None:
-                    failures.append({"dataset": dataset, "url": url, "error": str(error), "required": url == normalize_url(base_url)})
+                    failures.append({
+                        "dataset": dataset,
+                        "url": url,
+                        "error": str(error),
+                        "required": scope == "rss" or dataset in PAGE_DATASETS.values(),
+                    })
                     LOGGER.warning("PSE website fetch failed: url=%s error=%s", url, error)
                     continue
                 status = int(getattr(response, "status", 200) or 200)
                 if status == 304:
                     unchanged_count += 1
-                    prior = old_urls.get(url, {})
-                    discovered.extend(prior.get("outlinks", []))
                     continue
                 response_url = normalize_url(str(getattr(response, "url", url)))
                 if response_url is None or not host_allowed(response_url):
@@ -366,39 +619,34 @@ def crawl_public_site(
                     "status": status,
                     "size_bytes": len(payload),
                 }
-                outlinks: list[str] = []
                 inline_records: list[dict[str, Any]] = []
-                if dataset == "website_sitemaps" or (dataset != "website_feeds" and
-                    "xml" in content_type and "rss" not in content_type and "atom" not in content_type
-                ):
-                    parser = _LocParser()
-                    parser.feed(payload.decode("utf-8", errors="replace"))
-                    for row in parser.entries:
-                        candidate = normalize_url(row.get("loc", ""), url)
-                        if candidate and _likely_page(candidate):
-                            outlinks.append(candidate)
-                            inline_records.append({"record_type": "sitemap_url", "loc": candidate, "lastmod": row.get("lastmod", "")})
-                    sitemap_seen.add(url)
-                elif "html" in content_type or payload.lstrip().startswith((b"<", b"<!DOCTYPE")):
-                    try:
-                        parsed_records, links = parse_html_records(payload.decode("utf-8", errors="replace"), dataset, url)
-                        outlinks.extend(candidate for raw_link in links if (candidate := normalize_url(raw_link, url)) and _likely_page(candidate))
-                        descriptor["records_found"] = len(parsed_records)
-                    except Exception as exc:
-                        LOGGER.warning("Could not parse PSE website HTML links: url=%s error=%s", url, exc)
+                if captured_rows:
+                    inline_records.extend(captured_rows)
+                    descriptor["records_found"] = len(captured_rows)
                 elif dataset == "website_feeds" or "rss" in content_type or "atom" in content_type:
                     try:
-                        feed_records = parse_rss_records(payload, url)
-                        inline_records.extend(feed_records)
-                        outlinks.extend(candidate for item in feed_records if (candidate := normalize_url(str(item.get("link", "")), url)))
+                        inline_records.extend(parse_rss_records(payload, url))
+                        descriptor["records_found"] = len(inline_records)
                     except Exception as exc:
-                        failures.append({"dataset": dataset, "url": url, "error": f"Could not parse feed: {exc}", "required": False})
-                # Keep crawl edges explicit in the curated record set and in state.
-                descriptor["outlinks"] = sorted(set(outlinks))
+                        failures.append({"dataset": dataset, "url": url, "error": f"Could not parse RSS/Atom feed: {exc}", "required": scope == "rss"})
+                elif "html" in content_type or payload.lstrip().startswith((b"<", b"<!DOCTYPE")):
+                    try:
+                        parsed_records, _ = parse_html_records(payload.decode("utf-8", errors="replace"), dataset, url)
+                        descriptor["records_found"] = sum(record.get("record_type") == "table_row" for record in parsed_records)
+                    except Exception as exc:
+                        failures.append({"dataset": dataset, "url": url, "error": f"Could not parse source page: {exc}", "required": dataset in PAGE_DATASETS.values()})
+                if dataset in DYNAMIC_DATASETS and not int(descriptor.get("records_found", 0) or 0):
+                    failures.append(
+                        {
+                            "dataset": dataset,
+                            "url": url,
+                            "error": "Rendered source returned no non-empty table rows",
+                            "required": True,
+                        }
+                    )
                 if inline_records:
                     descriptor["inline_records"] = inline_records
                 objects.append(descriptor)
-                discovered.extend(descriptor["outlinks"])
                 response_headers = _headers(response)
                 next_state[url] = {
                     "raw_bucket": bucket,
@@ -406,14 +654,18 @@ def crawl_public_site(
                     "content_type": content_type,
                     "etag": response_headers.get("etag"),
                     "last_modified": response_headers.get("last-modified"),
-                    "outlinks": descriptor["outlinks"],
                     "fetched_at": started_at.isoformat(),
                 }
 
-            frontier = sorted((set(discovered) | deferred) - visited)
+            frontier = deferred
 
         truncated = bool(frontier)
-        if robots_disallowed_count and page_count == 0 and asset_count == 0:
+        page_datasets = set(PAGE_DATASETS.values())
+        if robots_unavailable_hosts:
+            coverage_status = "robots_policy_unavailable"
+        elif any(failure.get("dataset") in page_datasets or failure.get("dataset") == "website_feeds" for failure in failures):
+            coverage_status = "incomplete_source_failures"
+        elif robots_disallowed_count and page_count == 0 and asset_count == 0:
             coverage_status = "blocked_by_robots"
             failures.append(
                 {
@@ -428,7 +680,7 @@ def crawl_public_site(
         elif truncated:
             coverage_status = "incomplete_truncated"
         else:
-            coverage_status = "discovered_urls_captured"
+            coverage_status = "focused_sources_captured"
         # Robots directives and a crawl summary are always retained as structured controls.
         control_records = [
             {"record_type": "robots_policy", "host": host, "robots_url": f"https://{host}/robots.txt", "text": text[:100_000]}
@@ -467,7 +719,7 @@ def crawl_public_site(
     manifest = {
         "schema_version": 1,
         "source": "pse_website",
-        "scope": "public_site",
+        "scope": scope,
         "run_id": run_id,
         "started_at": started_at.isoformat(),
         "completed_at": completed_at.isoformat(),
@@ -489,7 +741,7 @@ def crawl_public_site(
         f"run_id={run_segment}-{hashlib.sha256(manifest_payload).hexdigest()[:16]}.json"
     )
     store.write(bucket, manifest_key, manifest_payload, "application/json")
-    # Persist validators and link graph only after the run manifest is durable.
+    # Persist validators only after the run manifest is durable.
     state = {
         "schema_version": 1,
         "updated_at": completed_at.isoformat(),
@@ -497,9 +749,9 @@ def crawl_public_site(
         "robots": robots_text,
         "frontier": sorted(set(frontier)),
     }
-    store.write(bucket, STATE_KEY, json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), "application/json")
+    store.write(bucket, state_key, json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), "application/json")
     LOGGER.info(
-        "PSE public website crawl complete: run_id=%s pages=%d assets=%d unchanged=%d failures=%d "
+        "PSE website capture complete: run_id=%s pages=%d assets=%d unchanged=%d failures=%d "
         "pending=%d robots_disallowed=%d coverage=%s truncated=%s manifest=s3://%s/%s",
         run_id,
         page_count,
@@ -515,6 +767,7 @@ def crawl_public_site(
     )
     return {
         "run_id": run_id,
+        "scope": scope,
         "bucket": bucket,
         "manifest_key": manifest_key,
         **{
